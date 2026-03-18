@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -107,6 +109,77 @@ func (ts *turnState) Info() *TurnInfo {
 		ChildTurnIDs: childIDs,
 		IsFinished:   ts.isFinished,
 	}
+}
+
+// GetAllActiveTurns retrieves information about all currently active turns across all sessions.
+func (al *AgentLoop) GetAllActiveTurns() []*TurnInfo {
+	var turns []*TurnInfo
+	al.activeTurnStates.Range(func(key, value interface{}) bool {
+		if ts, ok := value.(*turnState); ok {
+			turns = append(turns, ts.Info())
+		}
+		return true
+	})
+	return turns
+}
+
+// FormatTree recursively builds a string representation of the active turn tree.
+func (al *AgentLoop) FormatTree(turnInfo *TurnInfo, prefix string, isLast bool) string {
+	if turnInfo == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	
+	// Print current node
+	marker := "├── "
+	if isLast {
+		marker = "└── "
+	}
+	if turnInfo.Depth == 0 {
+		marker = "" // Root node no marker
+	}
+
+	status := "Running"
+	if turnInfo.IsFinished {
+		status = "Finished"
+	}
+
+	orphanMarker := ""
+	if turnInfo.Depth > 0 && prefix == "" {
+		orphanMarker = " (Orphaned)"
+	}
+
+	sb.WriteString(fmt.Sprintf("%s%s[%s] Depth:%d (%s)%s\n", prefix, marker, turnInfo.TurnID, turnInfo.Depth, status, orphanMarker))
+
+	// Prepare prefix for children
+	childPrefix := prefix
+	if turnInfo.Depth > 0 {
+		if isLast {
+			childPrefix += "    "
+		} else {
+			childPrefix += "│   "
+		}
+	}
+
+	for i, childID := range turnInfo.ChildTurnIDs {
+		// Look up child turn state
+		childInfo := al.GetActiveTurn(childID)
+		if childInfo != nil {
+			isLastChild := (i == len(turnInfo.ChildTurnIDs)-1)
+			sb.WriteString(al.FormatTree(childInfo, childPrefix, isLastChild))
+		} else {
+			// Child might have already been removed from active states if it finished early
+			isLastChild := (i == len(turnInfo.ChildTurnIDs)-1)
+			cMarker := "├── "
+			if isLastChild {
+				cMarker = "└── "
+			}
+			sb.WriteString(fmt.Sprintf("%s%s[%s] (Completed/Cleaned Up)\n", childPrefix, cMarker, childID))
+		}
+	}
+
+	return sb.String()
 }
 
 // ====================== Helper Functions ======================

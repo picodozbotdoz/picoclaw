@@ -2143,6 +2143,33 @@ func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOpt
 			}
 			return al.channelManager.GetEnabledChannels()
 		},
+		GetActiveTurn: func() interface{} {
+			turns := al.GetAllActiveTurns()
+			if len(turns) == 0 {
+				return nil
+			}
+
+			// Map to quickly check active turn existence
+			activeTurnMap := make(map[string]bool)
+			for _, t := range turns {
+				activeTurnMap[t.TurnID] = true
+			}
+
+			// Find effective roots (Depth == 0, OR parent is not active anymore)
+			var effectiveRoots []*TurnInfo
+			for _, t := range turns {
+				if t.Depth == 0 || !activeTurnMap[t.ParentTurnID] {
+					effectiveRoots = append(effectiveRoots, t)
+				}
+			}
+
+			var fullTree strings.Builder
+			for i, turnInfo := range effectiveRoots {
+				isLastRoot := (i == len(effectiveRoots)-1)
+				fullTree.WriteString(al.FormatTree(turnInfo, "", isLastRoot))
+			}
+			return fullTree.String()
+		},
 		SwitchChannel: func(value string) error {
 			if al.channelManager == nil {
 				return fmt.Errorf("channel manager not initialized")

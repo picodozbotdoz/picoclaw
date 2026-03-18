@@ -282,6 +282,10 @@ func spawnSubTurn(ctx context.Context, al *AgentLoop, parentTS *turnState, cfg S
 	childCtx = withTurnState(childCtx, childTS)
 	childCtx = WithAgentLoop(childCtx, al) // Propagate AgentLoop to child turn
 
+	// Register child turn state so GetAllActiveTurns/Subagents can find it
+	al.activeTurnStates.Store(childID, childTS)
+	defer al.activeTurnStates.Delete(childID)
+
 	// 5. Establish parent-child relationship (thread-safe)
 	parentTS.mu.Lock()
 	parentTS.childTurnIDs = append(parentTS.childTurnIDs, childID)
