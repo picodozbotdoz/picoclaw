@@ -122,6 +122,25 @@ func (al *AgentLoop) Steer(msg providers.Message) error {
 		"content_len": len(msg.Content),
 		"queue_len":   al.steering.len(),
 	})
+	agentID := ""
+	if registry := al.GetRegistry(); registry != nil {
+		if agent := registry.GetDefaultAgent(); agent != nil {
+			agentID = agent.ID
+		}
+	}
+	al.emitEvent(
+		EventKindInterruptReceived,
+		EventMeta{
+			AgentID:   agentID,
+			Source:    "Steer",
+			TracePath: "turn.interrupt.received",
+		},
+		InterruptReceivedPayload{
+			Role:       msg.Role,
+			ContentLen: len(msg.Content),
+			QueueDepth: al.steering.len(),
+		},
+	)
 
 	return nil
 }

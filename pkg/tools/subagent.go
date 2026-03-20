@@ -111,6 +111,9 @@ func (sm *SubagentManager) Spawn(
 func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, callback AsyncCallback) {
 	task.Status = "running"
 	task.Created = time.Now().UnixMilli()
+	// TODO(eventbus): once subagents are modeled as child turns inside
+	// pkg/agent, emit SubTurnEnd and SubTurnResultDelivered from the parent
+	// AgentLoop instead of this legacy manager.
 
 	// Build system prompt for subagent
 	systemPrompt := `You are a subagent. Complete the given task independently and report the result.

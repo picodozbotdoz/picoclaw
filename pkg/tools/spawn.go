@@ -96,6 +96,9 @@ func (t *SpawnTool) execute(ctx context.Context, args map[string]any, cb AsyncCa
 	}
 
 	// Pass callback to manager for async completion notification
+	// TODO(eventbus): when background subagents are migrated onto the
+	// agent package's runTurn/sub-turn tree, emit SubTurnSpawn here and move
+	// lifecycle events out of the legacy SubagentManager path.
 	result, err := t.manager.Spawn(ctx, task, label, agentID, channel, chatID, cb)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to spawn subagent: %v", err))

@@ -39,6 +39,7 @@ type AgentLoop struct {
 	cfg            *config.Config
 	registry       *AgentRegistry
 	state          *state.Manager
+	eventBus       *EventBus
 	running        atomic.Bool
 	summarizing    sync.Map
 	fallback       *providers.FallbackChain
@@ -49,6 +50,7 @@ type AgentLoop struct {
 	mcp            mcpRuntime
 	steering       *steeringQueue
 	mu             sync.RWMutex
+	turnSeq        atomic.Uint64
 	// Track active requests for safe provider cleanup
 	activeRequests sync.WaitGroup
 }
@@ -103,6 +105,7 @@ func NewAgentLoop(
 		cfg:         cfg,
 		registry:    registry,
 		state:       stateManager,
+		eventBus:    NewEventBus(),
 		summarizing: sync.Map{},
 		fallback:    fallbackChain,
 		cmdRegistry: commands.NewRegistry(commands.BuiltinDefinitions()),
@@ -380,6 +383,185 @@ func (al *AgentLoop) Close() {
 	}
 
 	al.GetRegistry().Close()
+	if al.eventBus != nil {
+		al.eventBus.Close()
+	}
+}
+
+// SubscribeEvents registers a subscriber for agent-loop events.
+func (al *AgentLoop) SubscribeEvents(buffer int) EventSubscription {
+	if al == nil || al.eventBus == nil {
+		ch := make(chan Event)
+		close(ch)
+		return EventSubscription{C: ch}
+	}
+	return al.eventBus.Subscribe(buffer)
+}
+
+// UnsubscribeEvents removes a previously registered event subscriber.
+func (al *AgentLoop) UnsubscribeEvents(id uint64) {
+	if al == nil || al.eventBus == nil {
+		return
+	}
+	al.eventBus.Unsubscribe(id)
+}
+
+// EventDrops returns the number of dropped events for the given kind.
+func (al *AgentLoop) EventDrops(kind EventKind) int64 {
+	if al == nil || al.eventBus == nil {
+		return 0
+	}
+	return al.eventBus.Dropped(kind)
+}
+
+type turnEventScope struct {
+	agentID    string
+	sessionKey string
+	turnID     string
+}
+
+func (al *AgentLoop) newTurnEventScope(agentID, sessionKey string) turnEventScope {
+	seq := al.turnSeq.Add(1)
+	return turnEventScope{
+		agentID:    agentID,
+		sessionKey: sessionKey,
+		turnID:     fmt.Sprintf("%s-turn-%d", agentID, seq),
+	}
+}
+
+func (ts turnEventScope) meta(iteration int, source, tracePath string) EventMeta {
+	return EventMeta{
+		AgentID:    ts.agentID,
+		TurnID:     ts.turnID,
+		SessionKey: ts.sessionKey,
+		Iteration:  iteration,
+		Source:     source,
+		TracePath:  tracePath,
+	}
+}
+
+func (al *AgentLoop) emitEvent(kind EventKind, meta EventMeta, payload any) {
+	evt := Event{
+		Kind:    kind,
+		Meta:    meta,
+		Payload: payload,
+	}
+
+	al.logEvent(evt)
+
+	if al == nil || al.eventBus == nil {
+		return
+	}
+	al.eventBus.Emit(evt)
+}
+
+func cloneEventArguments(args map[string]any) map[string]any {
+	if len(args) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]any, len(args))
+	for k, v := range args {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+func (al *AgentLoop) logEvent(evt Event) {
+	fields := map[string]any{
+		"event_kind":  evt.Kind.String(),
+		"agent_id":    evt.Meta.AgentID,
+		"turn_id":     evt.Meta.TurnID,
+		"session_key": evt.Meta.SessionKey,
+		"iteration":   evt.Meta.Iteration,
+	}
+
+	if evt.Meta.TracePath != "" {
+		fields["trace"] = evt.Meta.TracePath
+	}
+	if evt.Meta.Source != "" {
+		fields["source"] = evt.Meta.Source
+	}
+
+	switch payload := evt.Payload.(type) {
+	case TurnStartPayload:
+		fields["channel"] = payload.Channel
+		fields["chat_id"] = payload.ChatID
+		fields["user_len"] = len(payload.UserMessage)
+		fields["media_count"] = payload.MediaCount
+	case TurnEndPayload:
+		fields["status"] = payload.Status
+		fields["iterations_total"] = payload.Iterations
+		fields["duration_ms"] = payload.Duration.Milliseconds()
+		fields["final_len"] = payload.FinalContentLen
+	case LLMRequestPayload:
+		fields["model"] = payload.Model
+		fields["messages"] = payload.MessagesCount
+		fields["tools"] = payload.ToolsCount
+		fields["max_tokens"] = payload.MaxTokens
+	case LLMDeltaPayload:
+		fields["content_delta_len"] = payload.ContentDeltaLen
+		fields["reasoning_delta_len"] = payload.ReasoningDeltaLen
+	case LLMResponsePayload:
+		fields["content_len"] = payload.ContentLen
+		fields["tool_calls"] = payload.ToolCalls
+		fields["has_reasoning"] = payload.HasReasoning
+	case LLMRetryPayload:
+		fields["attempt"] = payload.Attempt
+		fields["max_retries"] = payload.MaxRetries
+		fields["reason"] = payload.Reason
+		fields["error"] = payload.Error
+		fields["backoff_ms"] = payload.Backoff.Milliseconds()
+	case ContextCompressPayload:
+		fields["reason"] = payload.Reason
+		fields["dropped_messages"] = payload.DroppedMessages
+		fields["remaining_messages"] = payload.RemainingMessages
+	case SessionSummarizePayload:
+		fields["summarized_messages"] = payload.SummarizedMessages
+		fields["kept_messages"] = payload.KeptMessages
+		fields["summary_len"] = payload.SummaryLen
+		fields["omitted_oversized"] = payload.OmittedOversized
+	case ToolExecStartPayload:
+		fields["tool"] = payload.Tool
+		fields["args_count"] = len(payload.Arguments)
+	case ToolExecEndPayload:
+		fields["tool"] = payload.Tool
+		fields["duration_ms"] = payload.Duration.Milliseconds()
+		fields["for_llm_len"] = payload.ForLLMLen
+		fields["for_user_len"] = payload.ForUserLen
+		fields["is_error"] = payload.IsError
+		fields["async"] = payload.Async
+	case ToolExecSkippedPayload:
+		fields["tool"] = payload.Tool
+		fields["reason"] = payload.Reason
+	case SteeringInjectedPayload:
+		fields["count"] = payload.Count
+		fields["total_content_len"] = payload.TotalContentLen
+	case FollowUpQueuedPayload:
+		fields["source_tool"] = payload.SourceTool
+		fields["channel"] = payload.Channel
+		fields["chat_id"] = payload.ChatID
+		fields["content_len"] = payload.ContentLen
+	case InterruptReceivedPayload:
+		fields["role"] = payload.Role
+		fields["content_len"] = payload.ContentLen
+		fields["queue_depth"] = payload.QueueDepth
+	case SubTurnSpawnPayload:
+		fields["child_agent_id"] = payload.AgentID
+		fields["label"] = payload.Label
+	case SubTurnEndPayload:
+		fields["child_agent_id"] = payload.AgentID
+		fields["status"] = payload.Status
+	case SubTurnResultDeliveredPayload:
+		fields["target_channel"] = payload.TargetChannel
+		fields["target_chat_id"] = payload.TargetChatID
+		fields["content_len"] = payload.ContentLen
+	case ErrorPayload:
+		fields["stage"] = payload.Stage
+		fields["error"] = payload.Message
+	}
+
+	logger.InfoCF("eventbus", fmt.Sprintf("Agent event: %s", evt.Kind.String()), fields)
 }
 
 func (al *AgentLoop) RegisterTool(tool tools.Tool) {
@@ -895,6 +1077,35 @@ func (al *AgentLoop) runAgentLoop(
 	agent *AgentInstance,
 	opts processOptions,
 ) (string, error) {
+	turnScope := al.newTurnEventScope(agent.ID, opts.SessionKey)
+	turnStartedAt := time.Now()
+	turnIterations := 0
+	turnFinalContentLen := 0
+	turnStatus := TurnEndStatusCompleted
+	defer func() {
+		al.emitEvent(
+			EventKindTurnEnd,
+			turnScope.meta(turnIterations, "runAgentLoop", "turn.end"),
+			TurnEndPayload{
+				Status:          turnStatus,
+				Iterations:      turnIterations,
+				Duration:        time.Since(turnStartedAt),
+				FinalContentLen: turnFinalContentLen,
+			},
+		)
+	}()
+
+	al.emitEvent(
+		EventKindTurnStart,
+		turnScope.meta(0, "runAgentLoop", "turn.start"),
+		TurnStartPayload{
+			Channel:     opts.Channel,
+			ChatID:      opts.ChatID,
+			UserMessage: opts.UserMessage,
+			MediaCount:  len(opts.Media),
+		},
+	)
+
 	// 0. Record last channel for heartbeat notifications (skip internal channels and cli)
 	if opts.Channel != "" && opts.ChatID != "" {
 		if !constants.IsInternalChannel(opts.Channel) {
@@ -937,7 +1148,17 @@ func (al *AgentLoop) runAgentLoop(
 		if isOverContextBudget(agent.ContextWindow, messages, toolDefs, agent.MaxTokens) {
 			logger.WarnCF("agent", "Proactive compression: context budget exceeded before LLM call",
 				map[string]any{"session_key": opts.SessionKey})
-			al.forceCompression(agent, opts.SessionKey)
+			if compression, ok := al.forceCompression(agent, opts.SessionKey); ok {
+				al.emitEvent(
+					EventKindContextCompress,
+					turnScope.meta(0, "runAgentLoop", "turn.context.compress"),
+					ContextCompressPayload{
+						Reason:            ContextCompressReasonProactive,
+						DroppedMessages:   compression.DroppedMessages,
+						RemainingMessages: compression.RemainingMessages,
+					},
+				)
+			}
 			newHistory := agent.Sessions.GetHistory(opts.SessionKey)
 			newSummary := agent.Sessions.GetSummary(opts.SessionKey)
 			messages = agent.ContextBuilder.BuildMessages(
@@ -952,8 +1173,10 @@ func (al *AgentLoop) runAgentLoop(
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 3. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
+	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts, turnScope)
+	turnIterations = iteration
 	if err != nil {
+		turnStatus = TurnEndStatusError
 		return "", err
 	}
 
@@ -964,6 +1187,7 @@ func (al *AgentLoop) runAgentLoop(
 	if finalContent == "" {
 		finalContent = opts.DefaultResponse
 	}
+	turnFinalContentLen = len(finalContent)
 
 	// 5. Save final assistant message to session
 	agent.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
@@ -971,7 +1195,7 @@ func (al *AgentLoop) runAgentLoop(
 
 	// 6. Optional: summarization
 	if opts.EnableSummary {
-		al.maybeSummarize(agent, opts.SessionKey, opts.Channel, opts.ChatID)
+		al.maybeSummarize(agent, opts.SessionKey, turnScope)
 	}
 
 	// 7. Optional: send response via bus
@@ -1058,6 +1282,7 @@ func (al *AgentLoop) runLLMIteration(
 	agent *AgentInstance,
 	messages []providers.Message,
 	opts processOptions,
+	turnScope turnEventScope,
 ) (string, int, error) {
 	iteration := 0
 	var finalContent string
@@ -1084,9 +1309,11 @@ func (al *AgentLoop) runLLMIteration(
 		// Inject pending steering messages into the conversation context
 		// before the next LLM call.
 		if len(pendingMessages) > 0 {
+			totalContentLen := 0
 			for _, pm := range pendingMessages {
 				messages = append(messages, pm)
 				agent.Sessions.AddMessage(opts.SessionKey, pm.Role, pm.Content)
+				totalContentLen += len(pm.Content)
 				logger.InfoCF("agent", "Injected steering message into context",
 					map[string]any{
 						"agent_id":    agent.ID,
@@ -1094,6 +1321,14 @@ func (al *AgentLoop) runLLMIteration(
 						"content_len": len(pm.Content),
 					})
 			}
+			al.emitEvent(
+				EventKindSteeringInjected,
+				turnScope.meta(iteration, "runLLMIteration", "turn.steering.injected"),
+				SteeringInjectedPayload{
+					Count:           len(pendingMessages),
+					TotalContentLen: totalContentLen,
+				},
+			)
 			pendingMessages = nil
 		}
 
@@ -1106,6 +1341,17 @@ func (al *AgentLoop) runLLMIteration(
 
 		// Build tool definitions
 		providerToolDefs := agent.Tools.ToProviderDefs()
+		al.emitEvent(
+			EventKindLLMRequest,
+			turnScope.meta(iteration, "runLLMIteration", "turn.llm.request"),
+			LLMRequestPayload{
+				Model:         activeModel,
+				MessagesCount: len(messages),
+				ToolsCount:    len(providerToolDefs),
+				MaxTokens:     agent.MaxTokens,
+				Temperature:   agent.Temperature,
+			},
+		)
 
 		// Log LLM request details
 		logger.DebugCF("agent", "LLM request",
@@ -1151,6 +1397,8 @@ func (al *AgentLoop) runLLMIteration(
 		callLLM := func() (*providers.LLMResponse, error) {
 			al.activeRequests.Add(1)
 			defer al.activeRequests.Done()
+			// TODO(eventbus): emit EventKindLLMDelta when providers expose
+			// streaming callbacks instead of only the final Chat response.
 
 			if len(activeCandidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
@@ -1206,6 +1454,17 @@ func (al *AgentLoop) runLLMIteration(
 
 			if isTimeoutError && retry < maxRetries {
 				backoff := time.Duration(retry+1) * 5 * time.Second
+				al.emitEvent(
+					EventKindLLMRetry,
+					turnScope.meta(iteration, "runLLMIteration", "turn.llm.retry"),
+					LLMRetryPayload{
+						Attempt:    retry + 1,
+						MaxRetries: maxRetries,
+						Reason:     "timeout",
+						Error:      err.Error(),
+						Backoff:    backoff,
+					},
+				)
 				logger.WarnCF("agent", "Timeout error, retrying after backoff", map[string]any{
 					"error":   err.Error(),
 					"retry":   retry,
@@ -1216,6 +1475,16 @@ func (al *AgentLoop) runLLMIteration(
 			}
 
 			if isContextError && retry < maxRetries {
+				al.emitEvent(
+					EventKindLLMRetry,
+					turnScope.meta(iteration, "runLLMIteration", "turn.llm.retry"),
+					LLMRetryPayload{
+						Attempt:    retry + 1,
+						MaxRetries: maxRetries,
+						Reason:     "context_limit",
+						Error:      err.Error(),
+					},
+				)
 				logger.WarnCF(
 					"agent",
 					"Context window error detected, attempting compression",
@@ -1233,7 +1502,17 @@ func (al *AgentLoop) runLLMIteration(
 					})
 				}
 
-				al.forceCompression(agent, opts.SessionKey)
+				if compression, ok := al.forceCompression(agent, opts.SessionKey); ok {
+					al.emitEvent(
+						EventKindContextCompress,
+						turnScope.meta(iteration, "runLLMIteration", "turn.context.compress"),
+						ContextCompressPayload{
+							Reason:            ContextCompressReasonRetry,
+							DroppedMessages:   compression.DroppedMessages,
+							RemainingMessages: compression.RemainingMessages,
+						},
+					)
+				}
 				newHistory := agent.Sessions.GetHistory(opts.SessionKey)
 				newSummary := agent.Sessions.GetSummary(opts.SessionKey)
 				messages = agent.ContextBuilder.BuildMessages(
@@ -1246,6 +1525,14 @@ func (al *AgentLoop) runLLMIteration(
 		}
 
 		if err != nil {
+			al.emitEvent(
+				EventKindError,
+				turnScope.meta(iteration, "runLLMIteration", "turn.error"),
+				ErrorPayload{
+					Stage:   "llm",
+					Message: err.Error(),
+				},
+			)
 			logger.ErrorCF("agent", "LLM call failed",
 				map[string]any{
 					"agent_id":  agent.ID,
@@ -1261,6 +1548,15 @@ func (al *AgentLoop) runLLMIteration(
 			response.Reasoning,
 			opts.Channel,
 			al.targetReasoningChannelID(opts.Channel),
+		)
+		al.emitEvent(
+			EventKindLLMResponse,
+			turnScope.meta(iteration, "runLLMIteration", "turn.llm.response"),
+			LLMResponsePayload{
+				ContentLen:   len(response.Content),
+				ToolCalls:    len(response.ToolCalls),
+				HasReasoning: response.Reasoning != "" || response.ReasoningContent != "",
+			},
 		)
 
 		logger.DebugCF("agent", "LLM response",
@@ -1352,6 +1648,14 @@ func (al *AgentLoop) runLLMIteration(
 					"tool":      tc.Name,
 					"iteration": iteration,
 				})
+			al.emitEvent(
+				EventKindToolExecStart,
+				turnScope.meta(iteration, "runLLMIteration", "turn.tool.start"),
+				ToolExecStartPayload{
+					Tool:      tc.Name,
+					Arguments: cloneEventArguments(tc.Arguments),
+				},
+			)
 
 			// Create async callback for tools that implement AsyncExecutor.
 			asyncCallback := func(_ context.Context, result *tools.ToolResult) {
@@ -1379,6 +1683,16 @@ func (al *AgentLoop) runLLMIteration(
 						"content_len": len(content),
 						"channel":     opts.Channel,
 					})
+				al.emitEvent(
+					EventKindFollowUpQueued,
+					turnScope.meta(iteration, "runLLMIteration", "turn.follow_up.queued"),
+					FollowUpQueuedPayload{
+						SourceTool: tc.Name,
+						Channel:    opts.Channel,
+						ChatID:     opts.ChatID,
+						ContentLen: len(content),
+					},
+				)
 
 				pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer pubCancel()
@@ -1390,6 +1704,7 @@ func (al *AgentLoop) runLLMIteration(
 				})
 			}
 
+			toolStart := time.Now()
 			toolResult := agent.Tools.ExecuteWithContext(
 				ctx,
 				tc.Name,
@@ -1398,6 +1713,7 @@ func (al *AgentLoop) runLLMIteration(
 				opts.ChatID,
 				asyncCallback,
 			)
+			toolDuration := time.Since(toolStart)
 
 			// Process tool result
 			if !toolResult.Silent && toolResult.ForUser != "" && opts.SendResponse {
@@ -1443,6 +1759,18 @@ func (al *AgentLoop) runLLMIteration(
 				Content:    contentForLLM,
 				ToolCallID: tc.ID,
 			}
+			al.emitEvent(
+				EventKindToolExecEnd,
+				turnScope.meta(iteration, "runLLMIteration", "turn.tool.end"),
+				ToolExecEndPayload{
+					Tool:       tc.Name,
+					Duration:   toolDuration,
+					ForLLMLen:  len(contentForLLM),
+					ForUserLen: len(toolResult.ForUser),
+					IsError:    toolResult.IsError,
+					Async:      toolResult.Async,
+				},
+			)
 			messages = append(messages, toolResultMsg)
 			agent.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
 
@@ -1464,6 +1792,14 @@ func (al *AgentLoop) runLLMIteration(
 					// Mark remaining tool calls as skipped
 					for j := i + 1; j < len(normalizedToolCalls); j++ {
 						skippedTC := normalizedToolCalls[j]
+						al.emitEvent(
+							EventKindToolExecSkipped,
+							turnScope.meta(iteration, "runLLMIteration", "turn.tool.skipped"),
+							ToolExecSkippedPayload{
+								Tool:   skippedTC.Name,
+								Reason: "queued user steering message",
+							},
+						)
 						toolResultMsg := providers.Message{
 							Role:       "tool",
 							Content:    "Skipped due to queued user message.",
@@ -1538,7 +1874,7 @@ func (al *AgentLoop) selectCandidates(
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.
-func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, chatID string) {
+func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey string, turnScope turnEventScope) {
 	newHistory := agent.Sessions.GetHistory(sessionKey)
 	tokenEstimate := al.estimateTokens(newHistory)
 	threshold := agent.ContextWindow * agent.SummarizeTokenPercent / 100
@@ -1549,10 +1885,15 @@ func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, c
 			go func() {
 				defer al.summarizing.Delete(summarizeKey)
 				logger.Debug("Memory threshold reached. Optimizing conversation history...")
-				al.summarizeSession(agent, sessionKey)
+				al.summarizeSession(agent, sessionKey, turnScope)
 			}()
 		}
 	}
+}
+
+type compressionResult struct {
+	DroppedMessages   int
+	RemainingMessages int
 }
 
 // forceCompression aggressively reduces context when the limit is hit.
@@ -1567,10 +1908,10 @@ func (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, c
 // prompt is built dynamically by BuildMessages and is NOT stored here.
 // The compression note is recorded in the session summary so that
 // BuildMessages can include it in the next system prompt.
-func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
+func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) (compressionResult, bool) {
 	history := agent.Sessions.GetHistory(sessionKey)
 	if len(history) <= 2 {
-		return
+		return compressionResult{}, false
 	}
 
 	// Split at a Turn boundary so no tool-call sequence is torn apart.
@@ -1624,6 +1965,11 @@ func (al *AgentLoop) forceCompression(agent *AgentInstance, sessionKey string) {
 		"dropped_msgs": droppedCount,
 		"new_count":    len(keptHistory),
 	})
+
+	return compressionResult{
+		DroppedMessages:   droppedCount,
+		RemainingMessages: len(keptHistory),
+	}, true
 }
 
 // GetStartupInfo returns information about loaded tools and skills for logging.
@@ -1715,7 +2061,7 @@ func formatToolsForLog(toolDefs []providers.ToolDefinition) string {
 }
 
 // summarizeSession summarizes the conversation history for a session.
-func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
+func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string, turnScope turnEventScope) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -1800,6 +2146,16 @@ func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
 		agent.Sessions.SetSummary(sessionKey, finalSummary)
 		agent.Sessions.TruncateHistory(sessionKey, keepCount)
 		agent.Sessions.Save(sessionKey)
+		al.emitEvent(
+			EventKindSessionSummarize,
+			turnScope.meta(0, "summarizeSession", "turn.session.summarize"),
+			SessionSummarizePayload{
+				SummarizedMessages: len(validMessages),
+				KeptMessages:       keepCount,
+				SummaryLen:         len(finalSummary),
+				OmittedOversized:   omitted,
+			},
+		)
 	}
 }
 
