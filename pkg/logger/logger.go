@@ -21,6 +21,8 @@ const (
 	WARN  = zerolog.WarnLevel
 	ERROR = zerolog.ErrorLevel
 	FATAL = zerolog.FatalLevel
+
+	Component = "component"
 )
 
 var (
@@ -50,6 +52,18 @@ func init() {
 
 			// Custom formatter to handle multiline strings and JSON objects
 			FormatFieldValue: formatFieldValue,
+			PartsOrder: []string{
+				zerolog.TimestampFieldName,
+				zerolog.LevelFieldName,
+				Component,
+				zerolog.CallerFieldName,
+				zerolog.MessageFieldName,
+			},
+			FieldsExclude: []string{Component},
+			FormatPrepare: func(fields map[string]any) error {
+				fields[Component] = fmt.Sprintf("\x1b[33m%v\x1b[0m", fields[Component])
+				return nil
+			},
 		}
 
 		logger = zerolog.New(consoleWriter).With().Timestamp().Caller().Logger()
@@ -193,7 +207,19 @@ func ConfigureFromEnv() {
 	}
 }
 
-func getCallerSkip() int {
+func getPackageNameFromFile(filePath string) string {
+	dir := filepath.Dir(filePath)
+	importPath := filepath.ToSlash(dir)
+
+	parts := strings.Split(importPath, "/")
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return parts[len(parts)-1]
+}
+
+func getCallerSkip() (int, string) {
 	for i := 2; i < 15; i++ {
 		pc, file, _, ok := runtime.Caller(i)
 		if !ok {
@@ -217,10 +243,10 @@ func getCallerSkip() int {
 			continue
 		}
 
-		return i - 1
+		return i - 1, getPackageNameFromFile(file)
 	}
 
-	return 3
+	return 3, "<unknown>"
 }
 
 //nolint:zerologlint
@@ -246,13 +272,15 @@ func logMessage(level LogLevel, component string, message string, fields map[str
 		return
 	}
 
-	skip := getCallerSkip()
+	skip, pkg := getCallerSkip()
 
 	event := getEvent(logger, level)
 
-	if component != "" {
-		event.Str("component", component)
+	if component == "" {
+		component = pkg
 	}
+
+	event.Str(Component, component)
 
 	appendFields(event, fields)
 	event.CallerSkipFrame(skip).Msg(message)
@@ -261,10 +289,7 @@ func logMessage(level LogLevel, component string, message string, fields map[str
 	if fileLogger.GetLevel() != zerolog.NoLevel {
 		fileEvent := getEvent(fileLogger, level)
 
-		if component != "" {
-			fileEvent.Str("component", component)
-		}
-		// fileEvent.Str("caller", fmt.Sprintf("%s:%d (%s)", callerFile, callerLine, callerFunc))
+		fileEvent.Str(Component, component)
 
 		appendFields(fileEvent, fields)
 		fileEvent.CallerSkipFrame(skip).Msg(message)
