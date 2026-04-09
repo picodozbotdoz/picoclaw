@@ -1409,7 +1409,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		Media:             msg.Media,
 		DefaultResponse:   defaultResponse,
 		EnableSummary:     true,
-		SendResponse:      msg.Channel == "pico",
+		SendResponse:      false,
 	}
 
 	// context-dependent commands check their own Runtime fields and report
@@ -2252,6 +2252,20 @@ turnLoop:
 			llmResponseFields["total_tokens"] = response.Usage.TotalTokens
 		}
 		logger.DebugCF("agent", "LLM response", llmResponseFields)
+
+		if al.bus != nil && ts.channel == "pico" {
+			liveContent := response.Content
+			if liveContent == "" && len(response.ToolCalls) == 0 && response.ReasoningContent != "" {
+				liveContent = response.ReasoningContent
+			}
+			if strings.TrimSpace(liveContent) != "" {
+				al.bus.PublishOutbound(turnCtx, bus.OutboundMessage{
+					Channel: ts.channel,
+					ChatID:  ts.chatID,
+					Content: liveContent,
+				})
+			}
+		}
 
 		if len(response.ToolCalls) == 0 || gracefulTerminal {
 			responseContent := response.Content
