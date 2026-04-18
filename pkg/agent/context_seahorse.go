@@ -6,6 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
@@ -15,10 +19,145 @@ import (
 	"github.com/sipeed/picoclaw/pkg/tokenizer"
 )
 
+// semanticRecall runs nmem context/recall to provide topic-relevant long-term memory.
+// It uses a background goroutine to keep "nmem context" (O(1), always-on) fresh,
+// and optionally queries "nmem recall" when the user message contains substantive keywords.
+type semanticRecall struct {
+	mu             sync.RWMutex
+	contextCache   string    // cached nmem context output
+	lastRefresh    time.Time // when context was last fetched
+	nmemBin        string    // path to nmem-wrapper
+	agentID        string    // neural-memory agent ID
+	refreshInterval time.Duration
+}
+
+const (
+	semanticRecallMaxTokens  = 300   // max tokens for recall injection
+	semanticRecallMinLength  = 10    // min user message length to trigger recall
+	semanticRefreshInterval  = 5 * time.Minute
+)
+
+// newSemanticRecall creates a semantic recall hook for the given agent.
+func newSemanticRecall(agentID string) *semanticRecall {
+	sr := &semanticRecall{
+		nmemBin:         "/home/plain/.picoclaw/bin/nmem-wrapper",
+		agentID:         agentID,
+		refreshInterval: semanticRefreshInterval,
+	}
+
+	// Try to find nmem binary
+	if _, err := exec.LookPath(sr.nmemBin); err != nil {
+		// Try without wrapper
+		if _, err2 := exec.LookPath("nmem"); err2 == nil {
+			sr.nmemBin = "nmem"
+		} else {
+			logger.WarnCF("seahorse", "semantic recall: nmem not found, disabled",
+				map[string]any{"error": err.Error()})
+			return nil
+		}
+	}
+
+	// Initial fetch (non-blocking)
+	go sr.refreshContext(context.Background())
+
+	return sr
+}
+
+// getContext returns the cached nmem context (recent memories).
+// Returns empty string if cache is cold or recall is disabled.
+func (sr *semanticRecall) getContext() string {
+	if sr == nil {
+		return ""
+	}
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+	return sr.contextCache
+}
+
+// recallForMessage runs a semantic recall query based on the user message.
+// Returns relevant context or empty string. Never blocks longer than 3 seconds.
+func (sr *semanticRecall) recallForMessage(ctx context.Context, userMessage string) string {
+	if sr == nil || sr.nmemBin == "" {
+		return ""
+	}
+	if len(strings.TrimSpace(userMessage)) < semanticRecallMinLength {
+		return ""
+	}
+
+	// Use context with 3s timeout
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, sr.nmemBin, sr.agentID, "recall",
+		userMessage,
+		"--max-tokens", fmt.Sprintf("%d", semanticRecallMaxTokens),
+		"--depth", "1",
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		logger.DebugCF("seahorse", "semantic recall failed",
+			map[string]any{"error": err.Error()})
+		return ""
+	}
+
+	result := strings.TrimSpace(string(out))
+	if len(result) > 0 && result != "No relevant memories found." {
+		logger.DebugCF("seahorse", "semantic recall hit",
+			map[string]any{"result_len": len(result)})
+		return result
+	}
+	return ""
+}
+
+// refreshContext periodically refreshes the nmem context cache in background.
+func (sr *semanticRecall) refreshContext(ctx context.Context) {
+	if sr == nil {
+		return
+	}
+
+	ticker := time.NewTicker(sr.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sr.fetchContext(ctx)
+		}
+	}
+}
+
+// fetchContext runs nmem context and updates the cache.
+func (sr *semanticRecall) fetchContext(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, sr.nmemBin, sr.agentID, "context",
+		"--limit", "5",
+		"--fresh-only",
+	)
+
+	out, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	result := strings.TrimSpace(string(out))
+	if len(result) > 0 {
+		sr.mu.Lock()
+		sr.contextCache = result
+		sr.lastRefresh = time.Now()
+		sr.mu.Unlock()
+	}
+}
+
 // seahorseContextManager adapts seahorse.Engine to agent.ContextManager.
 type seahorseContextManager struct {
-	engine   *seahorse.Engine
-	sessions session.SessionStore // for startup bootstrap
+	engine        *seahorse.Engine
+	sessions      session.SessionStore // for startup bootstrap
+	semanticRecall *semanticRecall      // neural-memory semantic context carry
 }
 
 // newSeahorseContextManager creates a seahorse-backed ContextManager.
@@ -43,9 +182,16 @@ func newSeahorseContextManager(_ json.RawMessage, al *AgentLoop) (ContextManager
 		return nil, fmt.Errorf("seahorse: create engine: %w", err)
 	}
 
+	// Determine agent ID for neural-memory
+	agentID := "default"
+	if agent != nil && agent.ID != "" {
+		agentID = agent.ID
+	}
+
 	mgr := &seahorseContextManager{
-		engine:   engine,
-		sessions: agent.Sessions,
+		engine:        engine,
+		sessions:      agent.Sessions,
+		semanticRecall: newSemanticRecall(agentID),
 	}
 
 	// Register seahorse tools with the agent's tool registry
@@ -86,6 +232,8 @@ func providerToCompleteFn(provider providers.LLMProvider, model string) seahorse
 }
 
 // Assemble builds budget-aware context from seahorse SQLite.
+// It also performs semantic context carry: when UserMessage is set, it queries
+// neural-memory for topic-relevant long-term memory and appends it to the summary.
 func (m *seahorseContextManager) Assemble(ctx context.Context, req *AssembleRequest) (*AssembleResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("seahorse assemble: nil request")
@@ -116,10 +264,51 @@ func (m *seahorseContextManager) Assemble(ctx context.Context, req *AssembleRequ
 	history := seahorseToProviderMessages(result)
 
 	// Summary is already formatted as XML with system prompt addition by assembler
+	summary := result.Summary
+
+	// Semantic Context Carry: enrich summary with neural-memory context.
+	// This runs in background to avoid blocking the assemble path.
+	if m.semanticRecall != nil && req.UserMessage != "" {
+		semanticCtx := m.buildSemanticContext(ctx, req.UserMessage)
+		if semanticCtx != "" {
+			if summary != "" {
+				summary += "\n\n"
+			}
+			summary += semanticCtx
+		}
+	}
+
 	return &AssembleResponse{
 		History: history,
-		Summary: result.Summary,
+		Summary: summary,
 	}, nil
+}
+
+// buildSemanticContext composes neural-memory context from cached recent memories
+// and topic-specific recall results.
+func (m *seahorseContextManager) buildSemanticContext(ctx context.Context, userMessage string) string {
+	var parts []string
+
+	// Part 1: Recent hot memories from cache (O(1), no LLM call)
+	if cached := m.semanticRecall.getContext(); cached != "" {
+		parts = append(parts, cached)
+	}
+
+	// Part 2: Topic-specific recall (runs nmem recall with timeout)
+	// Only for substantive messages (> semanticRecallMinLength)
+	if len(strings.TrimSpace(userMessage)) >= semanticRecallMinLength {
+		if topicCtx := m.semanticRecall.recallForMessage(ctx, userMessage); topicCtx != "" {
+			parts = append(parts, topicCtx)
+		}
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	return "LONG_TERM_MEMORY_CONTEXT (from neural-memory, for reference):\n" +
+		strings.Join(parts, "\n---\n") +
+		"\n(End of long-term memory context. Use nmem_recall or grep tools to dig deeper.)"
 }
 
 // Compact compresses conversation history via seahorse summarization.

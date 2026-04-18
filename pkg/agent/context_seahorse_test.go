@@ -1084,3 +1084,226 @@ func TestSeahorseSummarizeSkipsCondensedWhenBelowThreshold(t *testing.T) {
 		t.Errorf("BUG: condensed created when tokens (%d) < threshold (%d)", tokensBefore, threshold)
 	}
 }
+
+// --- Semantic Context Carry Tests ---
+
+func TestSemanticRecallNilSafe(t *testing.T) {
+	// Ensure nil semanticRecall doesn't panic
+	var sr *semanticRecall
+
+	if got := sr.getContext(); got != "" {
+		t.Errorf("nil semanticRecall.getContext() = %q, want empty", got)
+	}
+
+	if got := sr.recallForMessage(context.Background(), "hello world this is long enough"); got != "" {
+		t.Errorf("nil semanticRecall.recallForMessage() = %q, want empty", got)
+	}
+}
+
+func TestSemanticRecallShortMessageSkipsRecall(t *testing.T) {
+	sr := &semanticRecall{
+		nmemBin: "true", // /usr/bin/true - always succeeds, returns nothing
+		agentID: "test",
+	}
+
+	// Message shorter than semanticRecallMinLength should be skipped
+	if got := sr.recallForMessage(context.Background(), "hi"); got != "" {
+		t.Errorf("short message should skip recall, got %q", got)
+	}
+
+	// Empty message should be skipped
+	if got := sr.recallForMessage(context.Background(), ""); got != "" {
+		t.Errorf("empty message should skip recall, got %q", got)
+	}
+
+	// Whitespace-only message should be skipped
+	if got := sr.recallForMessage(context.Background(), "   "); got != "" {
+		t.Errorf("whitespace message should skip recall, got %q", got)
+	}
+}
+
+func TestSemanticRecallContextCache(t *testing.T) {
+	sr := &semanticRecall{
+		nmemBin: "true",
+		agentID: "test",
+	}
+
+	// Initially empty
+	if got := sr.getContext(); got != "" {
+		t.Errorf("initial context should be empty, got %q", got)
+	}
+
+	// Simulate fetch
+	sr.mu.Lock()
+	sr.contextCache = "cached context here"
+	sr.lastRefresh = time.Now()
+	sr.mu.Unlock()
+
+	if got := sr.getContext(); got != "cached context here" {
+		t.Errorf("getContext() = %q, want 'cached context here'", got)
+	}
+}
+
+func TestBuildSemanticContextEmpty(t *testing.T) {
+	mgr := &seahorseContextManager{
+		semanticRecall: nil,
+	}
+
+	// nil recall should return empty
+	if got := mgr.buildSemanticContext(context.Background(), "some message"); got != "" {
+		t.Errorf("nil recall buildSemanticContext() = %q, want empty", got)
+	}
+}
+
+func TestBuildSemanticContextWithCachedOnly(t *testing.T) {
+	sr := &semanticRecall{
+		nmemBin: "true",
+		agentID: "test",
+	}
+	sr.mu.Lock()
+	sr.contextCache = "Cached memory: project uses Go 1.25"
+	sr.lastRefresh = time.Now()
+	sr.mu.Unlock()
+
+	mgr := &seahorseContextManager{
+		semanticRecall: sr,
+	}
+
+	result := mgr.buildSemanticContext(context.Background(), "hello world")
+	if result == "" {
+		t.Fatal("expected non-empty semantic context")
+	}
+	if !strings.Contains(result, "LONG_TERM_MEMORY_CONTEXT") {
+		t.Error("should contain LONG_TERM_MEMORY_CONTEXT header")
+	}
+	if !strings.Contains(result, "Cached memory: project uses Go 1.25") {
+		t.Error("should contain cached context")
+	}
+}
+
+func TestBuildSemanticContextShortMessage(t *testing.T) {
+	sr := &semanticRecall{
+		nmemBin: "true",
+		agentID: "test",
+	}
+	sr.mu.Lock()
+	sr.contextCache = "Cached memory"
+	sr.lastRefresh = time.Now()
+	sr.mu.Unlock()
+
+	mgr := &seahorseContextManager{
+		semanticRecall: sr,
+	}
+
+	// Short message: should use cache only (no recall)
+	result := mgr.buildSemanticContext(context.Background(), "hi")
+	if !strings.Contains(result, "Cached memory") {
+		t.Error("short message should still use cached context")
+	}
+}
+
+func TestAssembleWithSemanticRecall(t *testing.T) {
+	engine, err := seahorse.NewEngine(seahorse.Config{
+		DBPath: t.TempDir() + "/test.db",
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	// Create a fake recall that returns cached context
+	sr := &semanticRecall{
+		nmemBin: "true",
+		agentID: "test",
+	}
+	sr.mu.Lock()
+	sr.contextCache = "Cached: Go 1.25, swap configured"
+	sr.lastRefresh = time.Now()
+	sr.mu.Unlock()
+
+	mgr := &seahorseContextManager{
+		engine:         engine,
+		semanticRecall: sr,
+	}
+
+	ctx := context.Background()
+
+	// Ingest some messages
+	for i := 0; i < 10; i++ {
+		_ = mgr.Ingest(ctx, &IngestRequest{
+			SessionKey: "semantic-test",
+			Message:    protocoltypes.Message{Role: "user", Content: fmt.Sprintf("Message %d", i)},
+		})
+	}
+
+	// Assemble WITH UserMessage → should include semantic context
+	resp, err := mgr.Assemble(ctx, &AssembleRequest{
+		SessionKey:  "semantic-test",
+		Budget:      50000,
+		MaxTokens:   4096,
+		UserMessage: "What version of Go am I using?",
+	})
+	if err != nil {
+		t.Fatalf("Assemble with semantic recall: %v", err)
+	}
+
+	if !strings.Contains(resp.Summary, "LONG_TERM_MEMORY_CONTEXT") {
+		t.Error("Summary should contain LONG_TERM_MEMORY_CONTEXT from semantic recall")
+	}
+	if !strings.Contains(resp.Summary, "Go 1.25") {
+		t.Error("Summary should contain cached memory content")
+	}
+
+	// Assemble WITHOUT UserMessage → should NOT include semantic context
+	resp2, err := mgr.Assemble(ctx, &AssembleRequest{
+		SessionKey: "semantic-test",
+		Budget:     50000,
+		MaxTokens:  4096,
+	})
+	if err != nil {
+		t.Fatalf("Assemble without user message: %v", err)
+	}
+
+	if strings.Contains(resp2.Summary, "LONG_TERM_MEMORY_CONTEXT") {
+		t.Error("Summary without UserMessage should NOT contain LONG_TERM_MEMORY_CONTEXT")
+	}
+}
+
+func TestAssembleSemanticRecallNilSafe(t *testing.T) {
+	engine, err := seahorse.NewEngine(seahorse.Config{
+		DBPath: t.TempDir() + "/test.db",
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	defer engine.Close()
+
+	mgr := &seahorseContextManager{
+		engine:         engine,
+		semanticRecall: nil,
+	}
+
+	ctx := context.Background()
+
+	// Ingest some messages
+	for i := 0; i < 5; i++ {
+		_ = mgr.Ingest(ctx, &IngestRequest{
+			SessionKey: "nil-semantic",
+			Message:    protocoltypes.Message{Role: "user", Content: fmt.Sprintf("Msg %d", i)},
+		})
+	}
+
+	// Should not panic with nil semanticRecall
+	resp, err := mgr.Assemble(ctx, &AssembleRequest{
+		SessionKey:  "nil-semantic",
+		Budget:      50000,
+		MaxTokens:   4096,
+		UserMessage: "long enough message to trigger recall",
+	})
+	if err != nil {
+		t.Fatalf("Assemble with nil recall: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+}

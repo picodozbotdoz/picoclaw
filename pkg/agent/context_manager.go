@@ -26,7 +26,6 @@ type ContextManager interface {
 	Ingest(ctx context.Context, req *IngestRequest) error
 
 	// Clear removes all stored context for a session (messages, summaries, etc.).
-	// Called when the user issues /clear or /reset.
 	Clear(ctx context.Context, sessionKey string) error
 }
 
@@ -35,6 +34,7 @@ type AssembleRequest struct {
 	SessionKey string // session identifier
 	Budget     int    // context window in tokens
 	MaxTokens  int    // max response tokens
+	UserMessage string // current user message for semantic recall (optional)
 }
 
 // AssembleResponse is the output of Assemble.
