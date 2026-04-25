@@ -69,3 +69,5 @@ web/backend/dist/*
 docker/data
 
 .omc/
+.cache/
+
