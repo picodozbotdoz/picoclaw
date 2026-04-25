@@ -14,7 +14,14 @@ export interface SessionDetail {
   messages: {
     role: "user" | "assistant"
     content: string
+    kind?: "normal" | "thought"
     media?: string[]
+    attachments?: {
+      type?: "image" | "audio" | "video" | "file"
+      url: string
+      filename?: string
+      content_type?: string
+    }[]
   }[]
   summary: string
   created: string

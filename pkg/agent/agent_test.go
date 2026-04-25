@@ -24,6 +24,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/routing"
 	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/tools"
+	"github.com/sipeed/picoclaw/pkg/utils"
 )
 
 type fakeChannel struct{ id string }
@@ -128,7 +129,7 @@ func useTestSideQuestionProvider(al *AgentLoop, provider providers.LLMProvider) 
 	al.providerFactory = func(mc *config.ModelConfig) (providers.LLMProvider, string, error) {
 		model := provider.GetDefaultModel()
 		if mc != nil {
-			if _, modelID := providers.ExtractProtocol(mc.Model); modelID != "" {
+			if _, modelID := providers.ExtractProtocol(mc); modelID != "" {
 				model = modelID
 			}
 		}
@@ -158,6 +159,58 @@ func newTestAgentLoop(
 	provider = &mockProvider{}
 	al = NewAgentLoop(cfg, msgBus, provider)
 	return al, cfg, msgBus, provider, func() { os.RemoveAll(tmpDir) }
+}
+
+func TestNewAgentLoop_RegistersWebSearchTool(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &mockProvider{})
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	if _, ok := agent.Tools.Get("web_search"); !ok {
+		t.Fatal("expected web_search tool to be registered")
+	}
+}
+
+func TestNewAgentLoop_RegistersWebSearchTool_WhenExplicitProviderUnavailable(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	cfg.Tools.Web.Provider = "brave"
+	cfg.Tools.Web.Brave.Enabled = true
+	cfg.Tools.Web.Sogou.Enabled = true
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &mockProvider{})
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	if _, ok := agent.Tools.Get("web_search"); !ok {
+		t.Fatal("expected web_search tool to fall back to auto provider selection")
+	}
+}
+
+func TestNewAgentLoop_DoesNotRegisterWebSearchTool_WhenNoReadyProviders(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = t.TempDir()
+	cfg.Tools.Web.Provider = "brave"
+	cfg.Tools.Web.Brave.Enabled = true
+	cfg.Tools.Web.Sogou.Enabled = false
+	cfg.Tools.Web.DuckDuckGo.Enabled = false
+
+	al := NewAgentLoop(cfg, bus.NewMessageBus(), &mockProvider{})
+
+	agent := al.registry.GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	if _, ok := agent.Tools.Get("web_search"); ok {
+		t.Fatal("expected web_search tool to be absent when no providers are ready")
+	}
 }
 
 func TestProcessMessage_IncludesCurrentSenderInDynamicContext(t *testing.T) {
@@ -1051,6 +1104,9 @@ func TestProcessMessage_MediaToolHandledSkipsFollowUpLLMAndFinalText(t *testing.
 	if last.Role != "assistant" || last.Content != "Requested output delivered via tool attachment." {
 		t.Fatalf("expected handled assistant summary in history, got %+v", last)
 	}
+	if len(last.Attachments) != 1 {
+		t.Fatalf("expected handled assistant summary attachments in history, got %+v", last.Attachments)
+	}
 }
 
 func TestProcessMessage_HandledToolProcessesQueuedSteeringBeforeReturning(t *testing.T) {
@@ -1664,6 +1720,38 @@ func (m *messageToolProvider) GetDefaultModel() string {
 	return "message-tool-model"
 }
 
+type reasoningVisibleToolProvider struct {
+	filePath string
+	calls    int
+}
+
+func (m *reasoningVisibleToolProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		return &providers.LLMResponse{
+			Content:          "I'll inspect that file now.",
+			ReasoningContent: "Read the file before answering.",
+			ToolCalls: []providers.ToolCall{{
+				ID:        "call_read_file",
+				Type:      "function",
+				Name:      "read_file",
+				Arguments: map[string]any{"path": m.filePath},
+			}},
+		}, nil
+	}
+	return &providers.LLMResponse{Content: "DONE"}, nil
+}
+
+func (m *reasoningVisibleToolProvider) GetDefaultModel() string {
+	return "reasoning-visible-tool-model"
+}
+
 type artifactThenSendProvider struct {
 	calls int
 }
@@ -1756,6 +1844,190 @@ func (m *toolFeedbackProvider) Chat(
 
 func (m *toolFeedbackProvider) GetDefaultModel() string {
 	return "heartbeat-tool-feedback-model"
+}
+
+type toolFeedbackReasoningProvider struct {
+	filePath string
+	calls    int
+}
+
+func (m *toolFeedbackReasoningProvider) Chat(
+	ctx context.Context,
+	messages []providers.Message,
+	tools []providers.ToolDefinition,
+	model string,
+	opts map[string]any,
+) (*providers.LLMResponse, error) {
+	m.calls++
+	if m.calls == 1 {
+		return &providers.LLMResponse{
+			ReasoningContent: "Read README.md first to confirm the context that needs to be changed.",
+			ToolCalls: []providers.ToolCall{{
+				ID:        "call_reasoning_read_file",
+				Type:      "function",
+				Name:      "read_file",
+				Arguments: map[string]any{"path": m.filePath},
+			}},
+		}, nil
+	}
+
+	return &providers.LLMResponse{
+		Content:   "DONE",
+		ToolCalls: []providers.ToolCall{},
+	}, nil
+}
+
+func (m *toolFeedbackReasoningProvider) GetDefaultModel() string {
+	return "tool-feedback-reasoning-model"
+}
+
+func TestToolFeedbackExplanationFromResponse_UsesCurrentContentFirst(t *testing.T) {
+	response := &providers.LLMResponse{
+		Content:          "Read README.md first",
+		ReasoningContent: "current reasoning fallback",
+	}
+	messages := []providers.Message{
+		{Role: "user", Content: "check file"},
+		{Role: "assistant", Content: "Previous turn explanation"},
+		{Role: "tool", Content: "tool output", ToolCallID: "call_1"},
+	}
+
+	got := toolFeedbackExplanationFromResponse(response, messages, 300)
+	if got != "Read README.md first" {
+		t.Fatalf("toolFeedbackExplanationFromResponse() = %q, want current content", got)
+	}
+}
+
+func TestSideQuestionResponseContent_FallsBackWhenContentIsWhitespace(t *testing.T) {
+	response := &providers.LLMResponse{
+		Content:          " \n\t ",
+		ReasoningContent: "reasoning fallback",
+	}
+
+	if got := sideQuestionResponseContent(response); got != "reasoning fallback" {
+		t.Fatalf("sideQuestionResponseContent() = %q, want %q", got, "reasoning fallback")
+	}
+}
+
+func TestResponseReasoningContent_FallsBackWhenReasoningIsWhitespace(t *testing.T) {
+	response := &providers.LLMResponse{
+		Reasoning:        " \n\t ",
+		ReasoningContent: "structured reasoning fallback",
+	}
+
+	if got := responseReasoningContent(response); got != "structured reasoning fallback" {
+		t.Fatalf("responseReasoningContent() = %q, want %q", got, "structured reasoning fallback")
+	}
+}
+
+func TestToolFeedbackExplanationFromResponse_UsesExplicitToolCallExtraContent(t *testing.T) {
+	response := &providers.LLMResponse{
+		ToolCalls: []providers.ToolCall{{
+			ID:   "call_1",
+			Name: "read_file",
+			ExtraContent: &providers.ExtraContent{
+				ToolFeedbackExplanation: "Read README.md first to confirm the current project structure.",
+			},
+		}},
+	}
+	messages := []providers.Message{
+		{Role: "user", Content: "check file"},
+		{Role: "assistant", Content: ""},
+		{Role: "tool", Content: "tool output", ToolCallID: "call_1"},
+	}
+
+	got := toolFeedbackExplanationFromResponse(response, messages, 300)
+	if got != "Read README.md first to confirm the current project structure." {
+		t.Fatalf("toolFeedbackExplanationFromResponse() = %q, want explicit tool feedback explanation", got)
+	}
+}
+
+func TestToolFeedbackExplanationForToolCall_PrefersToolSpecificExtraContent(t *testing.T) {
+	response := &providers.LLMResponse{
+		Content: "Shared explanation",
+		ToolCalls: []providers.ToolCall{
+			{
+				ID:   "call_1",
+				Name: "read_file",
+				ExtraContent: &providers.ExtraContent{
+					ToolFeedbackExplanation: "Read README.md first.",
+				},
+			},
+			{
+				ID:   "call_2",
+				Name: "edit_file",
+				ExtraContent: &providers.ExtraContent{
+					ToolFeedbackExplanation: "Update config example after reading it.",
+				},
+			},
+		},
+	}
+
+	got1 := toolFeedbackExplanationForToolCall(response, response.ToolCalls[0], nil, 300)
+	got2 := toolFeedbackExplanationForToolCall(response, response.ToolCalls[1], nil, 300)
+	if got1 != "Read README.md first." {
+		t.Fatalf("toolFeedbackExplanationForToolCall() first = %q, want tool-specific explanation", got1)
+	}
+	if got2 != "Update config example after reading it." {
+		t.Fatalf("toolFeedbackExplanationForToolCall() second = %q, want tool-specific explanation", got2)
+	}
+}
+
+func TestToolFeedbackExplanationForToolCall_DoesNotReuseAnotherToolCallExplanation(t *testing.T) {
+	response := &providers.LLMResponse{
+		ToolCalls: []providers.ToolCall{
+			{
+				ID:   "call_1",
+				Name: "read_file",
+			},
+			{
+				ID:   "call_2",
+				Name: "edit_file",
+				ExtraContent: &providers.ExtraContent{
+					ToolFeedbackExplanation: "Update config example after reading it.",
+				},
+			},
+		},
+	}
+	messages := []providers.Message{
+		{Role: "user", Content: "inspect the config and update the example"},
+	}
+
+	got := toolFeedbackExplanationForToolCall(response, response.ToolCalls[0], messages, 300)
+	want := utils.ToolFeedbackContinuationHint + ": inspect the config and update the example"
+	if got != want {
+		t.Fatalf("toolFeedbackExplanationForToolCall() = %q, want %q", got, want)
+	}
+}
+
+func TestToolFeedbackExplanationFromResponse_DoesNotUseReasoningContent(t *testing.T) {
+	response := &providers.LLMResponse{
+		Content:          "",
+		ReasoningContent: "hidden reasoning should not be shown",
+	}
+	messages := []providers.Message{
+		{Role: "user", Content: "check file"},
+		{Role: "assistant", Content: "Previous turn explanation"},
+		{Role: "user", Content: "Inspect README.md and update the config example."},
+		{Role: "tool", Content: "tool output", ToolCallID: "call_1"},
+	}
+
+	got := toolFeedbackExplanationFromResponse(response, messages, 300)
+	want := utils.ToolFeedbackContinuationHint + ": Inspect README.md and update the config example."
+	if got != want {
+		t.Fatalf("toolFeedbackExplanationFromResponse() = %q, want latest user content fallback", got)
+	}
+}
+
+func TestToolFeedbackArgsPreview_UsesJSONAndTruncates(t *testing.T) {
+	got := toolFeedbackArgsPreview(map[string]any{
+		"path":  "README.md",
+		"limit": 42,
+	}, 128)
+	want := "{\n  \"limit\": 42,\n  \"path\": \"README.md\"\n}"
+	if got != want {
+		t.Fatalf("toolFeedbackArgsPreview() = %q, want %q", got, want)
+	}
 }
 
 type picoInterleavedContentProvider struct {
@@ -2266,6 +2538,75 @@ func TestProcessMessage_CommandOutcomes(t *testing.T) {
 	}
 	if provider.calls != 2 {
 		t.Fatalf("LLM should be called for passthrough /new command, calls=%d", provider.calls)
+	}
+}
+
+func TestProcessMessage_MCPCommandsHandledWithoutLLMCall(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "agent-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	deferred := true
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Session: config.SessionConfig{
+			Dimensions: []string{"chat"},
+		},
+		Tools: config.ToolsConfig{
+			MCP: config.MCPConfig{
+				ToolConfig: config.ToolConfig{Enabled: true},
+				Discovery:  config.ToolDiscoveryConfig{Enabled: true},
+				Servers: map[string]config.MCPServerConfig{
+					"github": {
+						Enabled:  true,
+						Deferred: &deferred,
+					},
+				},
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &countingMockProvider{response: "LLM reply"}
+	al := NewAgentLoop(cfg, msgBus, provider)
+	helper := testHelper{al: al}
+
+	baseContext := bus.InboundContext{
+		Channel:  "whatsapp",
+		ChatID:   "chat1",
+		ChatType: "direct",
+		SenderID: "user1",
+	}
+
+	listResp := helper.executeAndGetResponse(t, context.Background(), bus.InboundMessage{
+		Context: baseContext,
+		Content: "/list mcp",
+	})
+	if !strings.Contains(listResp, "- `github`") || !strings.Contains(listResp, "Deferred: yes") {
+		t.Fatalf("unexpected /list mcp reply: %q", listResp)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("LLM should not be called for /list mcp, calls=%d", provider.calls)
+	}
+
+	showResp := helper.executeAndGetResponse(t, context.Background(), bus.InboundMessage{
+		Context: baseContext,
+		Content: "/show mcp github",
+	})
+	if showResp != "MCP server 'github' is configured but not connected" {
+		t.Fatalf("unexpected /show mcp reply: %q", showResp)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("LLM should not be called for /show mcp, calls=%d", provider.calls)
 	}
 }
 
@@ -3656,7 +3997,22 @@ func TestProcessMessage_PublishesToolFeedbackWhenEnabled(t *testing.T) {
 			t.Fatalf("unexpected tool feedback context: %+v", outbound.Context)
 		}
 		if !strings.Contains(outbound.Content, "`read_file`") {
-			t.Fatalf("tool feedback content = %q, want read_file preview", outbound.Content)
+			t.Fatalf("tool feedback content = %q, want read_file summary", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, utils.ToolFeedbackContinuationHint) {
+			t.Fatalf("tool feedback content = %q, want continuation hint fallback", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, "check tool feedback") {
+			t.Fatalf("tool feedback content = %q, want current user intent fallback", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, "\"path\":") {
+			t.Fatalf("tool feedback content = %q, want serialized tool arguments", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, heartbeatFile) {
+			t.Fatalf("tool feedback content = %q, want tool argument value", outbound.Content)
+		}
+		if strings.Contains(outbound.Content, "Previous turn explanation") {
+			t.Fatalf("tool feedback content = %q, want no previous assistant fallback", outbound.Content)
 		}
 		if outbound.AgentID != "main" {
 			t.Fatalf("tool feedback agent_id = %q, want main", outbound.AgentID)
@@ -3670,6 +4026,312 @@ func TestProcessMessage_PublishesToolFeedbackWhenEnabled(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected outbound tool feedback for regular messages")
 	}
+}
+
+func TestProcessMessage_PersistsReasoningContentInSessionHistory(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &reasoningContentProvider{
+		response:         "final answer",
+		reasoningContent: "thinking trace",
+	}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	response, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Channel:  "pico",
+		SenderID: "user1",
+		ChatID:   "pico:test-session",
+		Content:  "hello",
+	})
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if response != "final answer" {
+		t.Fatalf("processMessage() response = %q, want %q", response, "final answer")
+	}
+
+	store := al.GetRegistry().GetDefaultAgent().Sessions
+	sessionKeys := store.ListSessions()
+	if len(sessionKeys) != 1 {
+		t.Fatalf("session keys = %v, want exactly 1 active session", sessionKeys)
+	}
+	history := store.GetHistory(sessionKeys[0])
+	if len(history) < 2 {
+		t.Fatalf("session history len = %d, want at least 2", len(history))
+	}
+
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("last message role = %q, want assistant", last.Role)
+	}
+	if last.Content != "final answer" {
+		t.Fatalf("last message content = %q, want %q", last.Content, "final answer")
+	}
+	if last.ReasoningContent != "thinking trace" {
+		t.Fatalf("last message reasoning_content = %q, want %q", last.ReasoningContent, "thinking trace")
+	}
+}
+
+func TestProcessMessage_PersistsReasoningToolResponseAsSingleAssistantRecord(t *testing.T) {
+	tmpDir := t.TempDir()
+	inspectPath := filepath.Join(tmpDir, "inspect.txt")
+	if err := os.WriteFile(inspectPath, []byte("inspect me"), 0o644); err != nil {
+		t.Fatalf("WriteFile(inspectPath) error = %v", err)
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.Agents.Defaults.Workspace = tmpDir
+	cfg.Agents.Defaults.ModelName = "test-model"
+	cfg.Agents.Defaults.MaxTokens = 4096
+	cfg.Agents.Defaults.MaxToolIterations = 10
+
+	msgBus := bus.NewMessageBus()
+	provider := &reasoningVisibleToolProvider{filePath: inspectPath}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	response, err := al.processMessage(context.Background(), bus.InboundMessage{
+		Channel:  "telegram",
+		SenderID: "user1",
+		ChatID:   "chat1",
+		Content:  "hello",
+	})
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if response != "DONE" {
+		t.Fatalf("processMessage() response = %q, want %q", response, "DONE")
+	}
+
+	store := al.GetRegistry().GetDefaultAgent().Sessions
+	sessionKeys := store.ListSessions()
+	if len(sessionKeys) != 1 {
+		t.Fatalf("session keys = %v, want exactly 1 active session", sessionKeys)
+	}
+
+	history := store.GetHistory(sessionKeys[0])
+	if len(history) < 3 {
+		t.Fatalf("session history len = %d, want at least 3", len(history))
+	}
+
+	var assistantWithToolCall *providers.Message
+	for i := range history {
+		msg := history[i]
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			assistantWithToolCall = &msg
+			break
+		}
+	}
+	if assistantWithToolCall == nil {
+		t.Fatal("expected assistant history record with tool_calls")
+	}
+	if assistantWithToolCall.Content != "I'll inspect that file now." {
+		t.Fatalf("assistant content = %q, want %q", assistantWithToolCall.Content, "I'll inspect that file now.")
+	}
+	if assistantWithToolCall.ReasoningContent != "Read the file before answering." {
+		t.Fatalf("assistant reasoning_content = %q, want preserved", assistantWithToolCall.ReasoningContent)
+	}
+	if len(assistantWithToolCall.ToolCalls) != 1 {
+		t.Fatalf("assistant tool calls = %+v, want single read_file tool", assistantWithToolCall.ToolCalls)
+	}
+	if got := providers.NormalizeToolCall(assistantWithToolCall.ToolCalls[0]).Name; got != "read_file" {
+		t.Fatalf("assistant tool calls = %+v, want single read_file tool", assistantWithToolCall.ToolCalls)
+	}
+
+	sessionDir := filepath.Join(tmpDir, "sessions")
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%q) error = %v", sessionDir, err)
+	}
+
+	var jsonlPath string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		jsonlPath = filepath.Join(sessionDir, entry.Name())
+		break
+	}
+	if jsonlPath == "" {
+		t.Fatal("expected session jsonl file to be created")
+	}
+
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", jsonlPath, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("jsonl lines = %d, want at least 3", len(lines))
+	}
+
+	matchingRecords := 0
+	for _, line := range lines {
+		var msg providers.Message
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatalf("Unmarshal(jsonl line) error = %v", err)
+		}
+		if msg.Role != "assistant" {
+			continue
+		}
+		if msg.Content == "I'll inspect that file now." || msg.ReasoningContent == "Read the file before answering." {
+			matchingRecords++
+			toolName := ""
+			if len(msg.ToolCalls) == 1 {
+				toolName = providers.NormalizeToolCall(msg.ToolCalls[0]).Name
+			}
+			if msg.Content != "I'll inspect that file now." ||
+				msg.ReasoningContent != "Read the file before answering." ||
+				len(msg.ToolCalls) != 1 ||
+				toolName != "read_file" {
+				t.Fatalf("assistant jsonl record = %+v, want content+reasoning+tool_calls in one line", msg)
+			}
+		}
+	}
+	if matchingRecords != 1 {
+		t.Fatalf("matching assistant jsonl records = %d, want exactly 1 canonical assistant record", matchingRecords)
+	}
+}
+
+func TestProcessMessage_DoesNotLeakReasoningContentInToolFeedback(t *testing.T) {
+	tmpDir := t.TempDir()
+	heartbeatFile := filepath.Join(tmpDir, "tool-feedback-reasoning.txt")
+	if err := os.WriteFile(heartbeatFile, []byte("tool feedback task"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+				ToolFeedback: config.ToolFeedbackConfig{
+					Enabled:       true,
+					MaxArgsLength: 300,
+				},
+			},
+		},
+		Tools: config.ToolsConfig{
+			ReadFile: config.ReadFileToolConfig{
+				Enabled: true,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &toolFeedbackReasoningProvider{filePath: heartbeatFile}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	response, err := al.processMessage(context.Background(), testInboundMessage(bus.InboundMessage{
+		Channel:  "telegram",
+		SenderID: "user-1",
+		ChatID:   "chat-1",
+		Content:  "check reasoning fallback",
+	}))
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if response != "DONE" {
+		t.Fatalf("processMessage() response = %q, want %q", response, "DONE")
+	}
+
+	select {
+	case outbound := <-msgBus.OutboundChan():
+		if !strings.Contains(outbound.Content, "`read_file`") {
+			t.Fatalf("tool feedback content = %q, want read_file summary", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, utils.ToolFeedbackContinuationHint) {
+			t.Fatalf("tool feedback content = %q, want continuation hint fallback", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, "check reasoning fallback") {
+			t.Fatalf("tool feedback content = %q, want current user intent fallback", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, "\"path\":") {
+			t.Fatalf("tool feedback content = %q, want serialized tool arguments", outbound.Content)
+		}
+		if !strings.Contains(outbound.Content, heartbeatFile) {
+			t.Fatalf("tool feedback content = %q, want tool argument value", outbound.Content)
+		}
+		if strings.Contains(outbound.Content, "Read README.md first") {
+			t.Fatalf("tool feedback content = %q, should not leak hidden reasoning", outbound.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected outbound tool feedback without leaking reasoning")
+	}
+}
+
+func TestProcessMessage_DoesNotPublishToolFeedbackForDiscordWhenDisabled(t *testing.T) {
+	assertToolFeedbackNotPublishedWhenDisabled(t, "discord")
+}
+
+func assertToolFeedbackNotPublishedWhenDisabled(t *testing.T, channel string) {
+	t.Helper()
+
+	tmpDir := t.TempDir()
+	heartbeatFile := filepath.Join(tmpDir, "tool-feedback-"+channel+".txt")
+	if err := os.WriteFile(heartbeatFile, []byte("tool feedback task"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+			},
+		},
+		Tools: config.ToolsConfig{
+			ReadFile: config.ReadFileToolConfig{
+				Enabled: true,
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &toolFeedbackProvider{filePath: heartbeatFile}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	response, err := al.processMessage(context.Background(), testInboundMessage(bus.InboundMessage{
+		Channel:  channel,
+		SenderID: "user-1",
+		ChatID:   "chat-1",
+		Content:  "check tool feedback",
+	}))
+	if err != nil {
+		t.Fatalf("processMessage() error = %v", err)
+	}
+	if response != "HEARTBEAT_OK" {
+		t.Fatalf("processMessage() response = %q, want %q", response, "HEARTBEAT_OK")
+	}
+
+	select {
+	case outbound := <-msgBus.OutboundChan():
+		t.Fatalf("expected no outbound tool feedback for %s when disabled, got %+v", channel, outbound)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestProcessMessage_DoesNotPublishToolFeedbackForTelegramWhenDisabled(t *testing.T) {
+	assertToolFeedbackNotPublishedWhenDisabled(t, "telegram")
+}
+
+func TestProcessMessage_DoesNotPublishToolFeedbackForFeishuWhenDisabled(t *testing.T) {
+	assertToolFeedbackNotPublishedWhenDisabled(t, "feishu")
 }
 
 func TestProcessMessage_MessageToolPublishesOutboundWithTurnMetadata(t *testing.T) {
@@ -3842,6 +4504,85 @@ func TestRunAgentLoop_PicoSkipsInterimPublishWhenNotAllowed(t *testing.T) {
 	select {
 	case outbound := <-msgBus.OutboundChan():
 		t.Fatalf("unexpected outbound message when interim publish disabled: %+v", outbound)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestRun_PicoToolFeedbackSuppressesDuplicateInterimAssistantContent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cfg := &config.Config{
+		Agents: config.AgentsConfig{
+			Defaults: config.AgentDefaults{
+				Workspace:         tmpDir,
+				ModelName:         "test-model",
+				MaxTokens:         4096,
+				MaxToolIterations: 10,
+				ToolFeedback: config.ToolFeedbackConfig{
+					Enabled: true,
+				},
+			},
+		},
+	}
+
+	msgBus := bus.NewMessageBus()
+	provider := &picoInterleavedContentProvider{}
+	al := NewAgentLoop(cfg, msgBus, provider)
+
+	agent := al.GetRegistry().GetDefaultAgent()
+	if agent == nil {
+		t.Fatal("expected default agent")
+	}
+	agent.Tools.Register(&toolLimitTestTool{})
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- al.Run(runCtx)
+	}()
+
+	if err := msgBus.PublishInbound(context.Background(), bus.InboundMessage{
+		Channel:  "pico",
+		SenderID: "user-1",
+		ChatID:   "session-1",
+		Content:  "run with tools",
+	}); err != nil {
+		t.Fatalf("PublishInbound() error = %v", err)
+	}
+
+	outputs := make([]string, 0, 2)
+	deadline := time.After(2 * time.Second)
+	for len(outputs) < 2 {
+		select {
+		case outbound := <-msgBus.OutboundChan():
+			outputs = append(outputs, outbound.Content)
+		case <-deadline:
+			t.Fatalf("timed out waiting for pico outputs, got %v", outputs)
+		}
+	}
+
+	if outputs[0] != "🔧 `tool_limit_test_tool`\nintermediate model text\n```json\n{\n  \"value\": \"x\"\n}\n```" {
+		t.Fatalf("first outbound content = %q, want tool feedback summary", outputs[0])
+	}
+	if outputs[1] != "final model text" {
+		t.Fatalf("second outbound content = %q, want %q", outputs[1], "final model text")
+	}
+
+	runCancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Run() to exit")
+	}
+
+	select {
+	case outbound := <-msgBus.OutboundChan():
+		t.Fatalf("unexpected extra pico output after tool feedback + final reply: %+v", outbound)
 	case <-time.After(200 * time.Millisecond):
 	}
 }

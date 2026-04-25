@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/sipeed/picoclaw/pkg/channels/pico"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/health"
 	"github.com/sipeed/picoclaw/pkg/logger"
@@ -37,26 +36,10 @@ var gateway = struct {
 	startupDeadline     time.Time
 	logs                *LogBuffer
 	pidData             *ppid.PidFileData // pid file data read from picoclaw.pid.json
-	picoToken           string            // cached pico token from config (for proxy auth validation)
+	picoToken           string            // cached raw pico token for upstream gateway proxy injection
 }{
 	runtimeStatus: "stopped",
 	logs:          NewLogBuffer(200),
-}
-
-// refreshPicoToken updates gateway.picoToken from cfg
-func refreshPicoToken(cfg *config.Config) {
-	gateway.mu.Lock()
-	defer gateway.mu.Unlock()
-	var picoCfg config.PicoSettings
-	if bc := cfg.Channels.GetByType(config.ChannelPico); bc != nil {
-		decoded, err := bc.GetDecoded()
-		if err == nil && decoded != nil {
-			if p, ok := decoded.(*config.PicoSettings); ok {
-				picoCfg = *p
-			}
-		}
-	}
-	gateway.picoToken = picoCfg.Token.String()
 }
 
 // refreshPicoTokensLocked reads the pico token from config and caches it.
@@ -101,18 +84,15 @@ const (
 	tokenPrefix = "token."
 )
 
-// picoComposedToken returns "pico-"+pidToken+picoToken for gateway auth.
-func picoComposedToken(token string) string {
+// picoGatewayProtocol returns the gateway-facing pico subprotocol that the
+// launcher should inject when proxying browser traffic upstream.
+func picoGatewayProtocol() string {
 	gateway.mu.Lock()
 	defer gateway.mu.Unlock()
-	// if not initial pico token, don't allow gateway auth
-	if gateway.picoToken == "" || gateway.pidData == nil {
+	if gateway.picoToken == "" {
 		return ""
 	}
-	if tokenPrefix+gateway.picoToken != token {
-		return ""
-	}
-	return pico.PicoTokenPrefix + gateway.pidData.Token + gateway.picoToken
+	return tokenPrefix + gateway.picoToken
 }
 
 var (
@@ -184,7 +164,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 			`$p=Get-CimInstance Win32_Process -Filter "ProcessId = %d"; if ($null -eq $p) { "" } else { $p.CommandLine }`,
 			pid,
 		)
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Output()
+		out, err := launcherExecCommand("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Output()
 		if err == nil {
 			cmdline := strings.TrimSpace(string(out))
 			if cmdline != "" {
@@ -193,7 +173,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 		}
 
 		// Fallback: determine only whether the process still exists.
-		out, err = exec.Command("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH").Output()
+		out, err = launcherExecCommand("tasklist", "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH").Output()
 		if err != nil {
 			return false, false
 		}
@@ -207,7 +187,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 			if strings.Contains(line, "\"picoclaw.exe\"") {
 				return true, true
 			}
-			return false, false
+			return false, true
 		}
 		if strings.Contains(line, "no tasks are running") {
 			return false, true
@@ -215,7 +195,7 @@ func isLikelyGatewayProcess(pid int) (bool, bool) {
 		return false, true
 	}
 
-	out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	out, err := launcherExecCommand("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return false, false
 	}
@@ -726,6 +706,7 @@ func (h *Handler) startGatewayLocked(initialStatus string, existingPid int) (int
 	logger.InfoC("gateway", fmt.Sprintf("Starting gateway process (%s)", execPath))
 
 	cmd = gatewayExecCommand(execPath, h.gatewayCommandArgs()...)
+	applyLauncherProcAttrs(cmd)
 	cmd.Env = os.Environ()
 	// Forward the launcher's config path via the environment variable that
 	// GetConfigPath() already reads, so the gateway sub-process uses the same
@@ -752,7 +733,7 @@ func (h *Handler) startGatewayLocked(initialStatus string, existingPid int) (int
 	gateway.logs.Reset()
 
 	// Ensure Pico Channel is configured before starting gateway
-	changed, err := h.EnsurePicoChannel("")
+	changed, err := h.EnsurePicoChannel()
 	if err != nil {
 		logger.ErrorC("gateway", fmt.Sprintf("Warning: failed to ensure pico channel: %v", err))
 		// Non-fatal: gateway can still start without pico channel

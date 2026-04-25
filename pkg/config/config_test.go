@@ -787,6 +787,9 @@ func TestDefaultConfig_ToolFeedbackDisabled(t *testing.T) {
 	if cfg.Agents.Defaults.ToolFeedback.Enabled {
 		t.Fatal("DefaultConfig().Agents.Defaults.ToolFeedback.Enabled should be false")
 	}
+	if cfg.Agents.Defaults.ToolFeedback.SeparateMessages {
+		t.Fatal("DefaultConfig().Agents.Defaults.ToolFeedback.SeparateMessages should be false")
+	}
 }
 
 func TestLoadConfig_ToolFeedbackDefaultsFalseWhenUnset(t *testing.T) {
@@ -806,6 +809,9 @@ func TestLoadConfig_ToolFeedbackDefaultsFalseWhenUnset(t *testing.T) {
 	}
 	if cfg.Agents.Defaults.ToolFeedback.Enabled {
 		t.Fatal("agents.defaults.tool_feedback.enabled should remain false when unset in config file")
+	}
+	if cfg.Agents.Defaults.ToolFeedback.SeparateMessages {
+		t.Fatal("agents.defaults.tool_feedback.separate_messages should remain false when unset in config file")
 	}
 }
 
@@ -1259,6 +1265,11 @@ func TestFlexibleStringSlice_UnmarshalJSON(t *testing.T) {
 		expected []string
 	}{
 		{
+			name:     "null",
+			input:    `null`,
+			expected: nil,
+		},
+		{
 			name:     "single string",
 			input:    `"Thinking..."`,
 			expected: []string{"Thinking..."},
@@ -1285,6 +1296,12 @@ func TestFlexibleStringSlice_UnmarshalJSON(t *testing.T) {
 			var f FlexibleStringSlice
 			if err := json.Unmarshal([]byte(tt.input), &f); err != nil {
 				t.Fatalf("json.Unmarshal(%s) error = %v", tt.input, err)
+			}
+			if tt.expected == nil {
+				if f != nil {
+					t.Fatalf("json.Unmarshal(%s) = %#v, want nil slice", tt.input, f)
+				}
+				return
 			}
 			if len(f) != len(tt.expected) {
 				t.Fatalf("json.Unmarshal(%s) len = %d, want %d", tt.input, len(f), len(tt.expected))
@@ -1933,7 +1950,7 @@ func TestDefaultConfig_MinimaxExtraBody(t *testing.T) {
 
 	var minimaxCfg *ModelConfig
 	for i := range cfg.ModelList {
-		if cfg.ModelList[i].Model == "minimax/MiniMax-M2.5" {
+		if cfg.ModelList[i].Provider == "minimax" && cfg.ModelList[i].Model == "MiniMax-M2.5" {
 			minimaxCfg = cfg.ModelList[i]
 			break
 		}

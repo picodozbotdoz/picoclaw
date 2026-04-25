@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/memory"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/providers/messageutil"
 	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/utils"
 )
@@ -46,9 +48,18 @@ type sessionListItem struct {
 }
 
 type sessionChatMessage struct {
-	Role    string   `json:"role"`
-	Content string   `json:"content"`
-	Media   []string `json:"media,omitempty"`
+	Role        string                  `json:"role"`
+	Content     string                  `json:"content"`
+	Kind        string                  `json:"kind,omitempty"`
+	Media       []string                `json:"media,omitempty"`
+	Attachments []sessionChatAttachment `json:"attachments,omitempty"`
+}
+
+type sessionChatAttachment struct {
+	Type        string `json:"type,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 // legacyPicoSessionPrefix is the legacy key prefix used by older Pico JSON/JSONL
@@ -143,6 +154,9 @@ func (h *Handler) readSessionMessages(path string, skip int) ([]providers.Messag
 
 		var msg providers.Message
 		if err := json.Unmarshal(line, &msg); err != nil {
+			continue
+		}
+		if messageutil.IsTransientAssistantThoughtMessage(msg) {
 			continue
 		}
 		msgs = append(msgs, msg)
@@ -398,10 +412,12 @@ func (h *Handler) findLegacyPicoSession(dir, sessionID string) (picoLegacySessio
 }
 
 func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArgsLength int) sessionListItem {
+	transcript := visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength)
+
 	preview := ""
-	for _, msg := range sess.Messages {
+	for _, msg := range transcript {
 		if msg.Role == "user" {
-			preview = sessionMessagePreview(msg)
+			preview = sessionChatMessagePreview(msg)
 		}
 		if preview != "" {
 			break
@@ -414,13 +430,11 @@ func buildSessionListItem(sessionID string, sess sessionFile, toolFeedbackMaxArg
 	}
 	title := preview
 
-	validMessageCount := len(visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength))
-
 	return sessionListItem{
 		ID:           sessionID,
 		Title:        title,
 		Preview:      preview,
-		MessageCount: validMessageCount,
+		MessageCount: len(transcript),
 		Created:      sess.Created.Format(time.RFC3339),
 		Updated:      sess.Updated.Format(time.RFC3339),
 	}
@@ -441,39 +455,70 @@ func truncateRunes(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "..."
 }
 
-func sessionMessageVisible(msg providers.Message) bool {
-	return strings.TrimSpace(msg.Content) != "" || len(msg.Media) > 0
+func sessionChatMessageVisible(msg sessionChatMessage) bool {
+	return strings.TrimSpace(msg.Content) != "" || len(msg.Media) > 0 || len(msg.Attachments) > 0
 }
 
-func sessionMessagePreview(msg providers.Message) string {
+func sessionChatMessagePreview(msg sessionChatMessage) string {
 	if content := strings.TrimSpace(msg.Content); content != "" {
 		return content
 	}
+	if len(msg.Attachments) > 0 {
+		if strings.EqualFold(strings.TrimSpace(msg.Attachments[0].Type), "image") {
+			return "[image]"
+		}
+		return "[attachment]"
+	}
 	if len(msg.Media) > 0 {
-		return "[image]"
+		if strings.HasPrefix(strings.TrimSpace(msg.Media[0]), "data:image/") {
+			return "[image]"
+		}
+		return "[attachment]"
 	}
 	return ""
 }
 
 func visibleSessionMessages(messages []providers.Message, toolFeedbackMaxArgsLength int) []sessionChatMessage {
+	return sessionTranscriptMessages(messages, toolFeedbackMaxArgsLength, false)
+}
+
+func detailSessionMessages(messages []providers.Message, toolFeedbackMaxArgsLength int) []sessionChatMessage {
+	return sessionTranscriptMessages(messages, toolFeedbackMaxArgsLength, true)
+}
+
+func sessionTranscriptMessages(
+	messages []providers.Message,
+	toolFeedbackMaxArgsLength int,
+	includeThoughts bool,
+) []sessionChatMessage {
 	transcript := make([]sessionChatMessage, 0, len(messages))
 
 	for _, msg := range messages {
+		attachments := sessionAttachments(msg)
+
 		switch msg.Role {
+		case "tool":
+			continue
+
 		case "user":
-			if sessionMessageVisible(msg) {
-				transcript = append(transcript, sessionChatMessage{
-					Role:    "user",
-					Content: msg.Content,
-					Media:   append([]string(nil), msg.Media...),
-				})
+			chatMsg := sessionChatMessage{
+				Role:        "user",
+				Content:     msg.Content,
+				Media:       append([]string(nil), msg.Media...),
+				Attachments: attachments,
+			}
+			if sessionChatMessageVisible(chatMsg) {
+				transcript = append(transcript, chatMsg)
 			}
 
 		case "assistant":
-			// Reasoning-only assistant messages are transient display artifacts and
-			// should not be restored from session history.
-			if assistantMessageTransientThought(msg) {
+			if messageutil.IsTransientAssistantThoughtMessage(msg) {
 				continue
+			}
+			if includeThoughts {
+				if thoughtMsg, ok := assistantThoughtMessage(msg); ok {
+					transcript = append(transcript, thoughtMsg)
+				}
 			}
 
 			toolSummaryMessages := visibleAssistantToolSummaryMessages(msg.ToolCalls, toolFeedbackMaxArgsLength)
@@ -486,33 +531,193 @@ func visibleSessionMessages(messages []providers.Message, toolFeedbackMaxArgsLen
 				transcript = append(transcript, visibleToolMessages...)
 			}
 
-			// Pico web chat can persist both visible `message` tool output and a
-			// later plain assistant reply in the same turn. Hide only the fixed
-			// internal summary that marks handled tool delivery.
-			if !sessionMessageVisible(msg) || assistantMessageInternalOnly(msg) {
+			// When assistant content exactly matches the rendered tool summary or
+			// tool-delivered message, skip it to avoid duplicates. Distinct content
+			// must remain visible in restored session history.
+			if len(msg.ToolCalls) > 0 &&
+				len(msg.Media) == 0 &&
+				len(attachments) == 0 &&
+				assistantToolCallContentDuplicated(msg.Content, toolSummaryMessages, visibleToolMessages) {
 				continue
 			}
 
-			transcript = append(transcript, sessionChatMessage{
-				Role:    "assistant",
-				Content: msg.Content,
-				Media:   append([]string(nil), msg.Media...),
-			})
+			// Pico web chat can persist both visible `message` tool output and a
+			// later plain assistant reply in the same turn. Hide only the fixed
+			// internal summary that marks handled tool delivery.
+			content := msg.Content
+			if assistantMessageInternalOnly(msg) {
+				if len(attachments) == 0 {
+					continue
+				}
+				content = ""
+			}
+
+			chatMsg := sessionChatMessage{
+				Role:        "assistant",
+				Content:     content,
+				Media:       append([]string(nil), msg.Media...),
+				Attachments: attachments,
+			}
+			if !sessionChatMessageVisible(chatMsg) {
+				continue
+			}
+
+			transcript = append(transcript, chatMsg)
 		}
 	}
 
-	return transcript
+	return filterSessionChatMessages(transcript)
 }
 
-func assistantMessageTransientThought(msg providers.Message) bool {
-	return strings.TrimSpace(msg.Content) == "" &&
-		strings.TrimSpace(msg.ReasoningContent) != "" &&
-		len(msg.ToolCalls) == 0 &&
-		len(msg.Media) == 0
+func filterSessionChatMessages(messages []sessionChatMessage) []sessionChatMessage {
+	filtered := messages[:0]
+	for _, msg := range messages {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	return filtered
+}
+
+func assistantToolCallContentDuplicated(
+	content string,
+	toolSummaryMessages []sessionChatMessage,
+	visibleToolMessages []sessionChatMessage,
+) bool {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return false
+	}
+
+	for _, msg := range toolSummaryMessages {
+		if toolSummaryContainsContent(msg.Content, content) {
+			return true
+		}
+	}
+	for _, msg := range visibleToolMessages {
+		if strings.TrimSpace(msg.Content) == content {
+			return true
+		}
+	}
+	return false
+}
+
+func toolSummaryContainsContent(summary, content string) bool {
+	summary = strings.TrimSpace(summary)
+	content = strings.TrimSpace(content)
+	if summary == "" || content == "" {
+		return false
+	}
+	if summary == content {
+		return true
+	}
+
+	_, body, hasBody := strings.Cut(summary, "\n")
+	if !hasBody {
+		return false
+	}
+	body = strings.TrimSpace(body)
+	if body == content {
+		return true
+	}
+	firstSection, _, _ := strings.Cut(body, "\n```")
+	return strings.TrimSpace(firstSection) == content
+}
+
+func sessionAttachments(msg providers.Message) []sessionChatAttachment {
+	if len(msg.Attachments) == 0 {
+		return nil
+	}
+
+	attachments := make([]sessionChatAttachment, 0, len(msg.Attachments))
+	for _, attachment := range msg.Attachments {
+		urlValue, ok := sessionAttachmentURL(attachment)
+		if !ok {
+			continue
+		}
+		attachmentType := strings.TrimSpace(attachment.Type)
+		if attachmentType == "" {
+			attachmentType = sessionAttachmentType(attachment)
+		}
+		attachments = append(attachments, sessionChatAttachment{
+			Type:        attachmentType,
+			URL:         urlValue,
+			Filename:    strings.TrimSpace(attachment.Filename),
+			ContentType: strings.TrimSpace(attachment.ContentType),
+		})
+	}
+
+	if len(attachments) == 0 {
+		return nil
+	}
+	return attachments
+}
+
+func sessionAttachmentURL(attachment providers.Attachment) (string, bool) {
+	if rawURL := strings.TrimSpace(attachment.URL); rawURL != "" {
+		return rawURL, true
+	}
+
+	ref := strings.TrimSpace(attachment.Ref)
+	if ref == "" {
+		return "", false
+	}
+	if strings.HasPrefix(ref, "media://") {
+		// Persisted session history must only expose durable attachment locations.
+		// media:// refs depend on the live in-memory MediaStore and may stop
+		// resolving after a restart or cleanup, so omit them from reopened history.
+		return "", false
+	}
+	return ref, true
+}
+
+func sessionAttachmentType(attachment providers.Attachment) string {
+	contentType := strings.ToLower(strings.TrimSpace(attachment.ContentType))
+	filename := strings.ToLower(strings.TrimSpace(attachment.Filename))
+	rawRef := strings.ToLower(strings.TrimSpace(attachment.Ref))
+	rawURL := strings.ToLower(strings.TrimSpace(attachment.URL))
+
+	switch {
+	case strings.HasPrefix(contentType, "image/"),
+		strings.HasPrefix(rawRef, "data:image/"),
+		strings.HasPrefix(rawURL, "data:image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	}
+
+	switch ext := filepath.Ext(filename); ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg":
+		return "image"
+	case ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".wma", ".opus":
+		return "audio"
+	case ".mp4", ".avi", ".mov", ".webm", ".mkv":
+		return "video"
+	default:
+		return "file"
+	}
 }
 
 func assistantMessageInternalOnly(msg providers.Message) bool {
 	return strings.TrimSpace(msg.Content) == handledToolResponseSummaryText
+}
+
+func assistantThoughtMessage(msg providers.Message) (sessionChatMessage, bool) {
+	reasoning := strings.TrimSpace(msg.ReasoningContent)
+	if reasoning == "" {
+		return sessionChatMessage{}, false
+	}
+	if reasoning == strings.TrimSpace(msg.Content) {
+		return sessionChatMessage{}, false
+	}
+	return sessionChatMessage{
+		Role:    "assistant",
+		Content: reasoning,
+		Kind:    "thought",
+	}, true
 }
 
 func visibleAssistantToolSummaryMessages(
@@ -528,37 +733,67 @@ func visibleAssistantToolSummaryMessages(
 
 	messages := make([]sessionChatMessage, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		name := tc.Name
-		argsJSON := ""
-		if tc.Function != nil {
-			if name == "" {
-				name = tc.Function.Name
-			}
-			argsJSON = tc.Function.Arguments
-		}
-
+		name, argsJSON := toolCallNameAndArguments(tc)
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
-
-		if strings.TrimSpace(argsJSON) == "" && len(tc.Arguments) > 0 {
-			if encodedArgs, err := json.Marshal(tc.Arguments); err == nil {
-				argsJSON = string(encodedArgs)
+		if name == "web_search" || name == "web_fetch" {
+			continue
+		}
+		if name == "message" {
+			if _, ok := parseMessageToolContent(argsJSON); ok {
+				continue
 			}
 		}
 
-		argsPreview := strings.TrimSpace(argsJSON)
-		if argsPreview == "" {
-			argsPreview = "{}"
-		}
-
 		messages = append(messages, sessionChatMessage{
-			Role:    "assistant",
-			Content: utils.FormatToolFeedbackMessage(name, utils.Truncate(argsPreview, toolFeedbackMaxArgsLength)),
+			Role: "assistant",
+			Content: utils.FormatToolFeedbackMessage(
+				name,
+				visibleAssistantToolFeedbackExplanation(tc, toolFeedbackMaxArgsLength),
+				visibleAssistantToolArgsPreview(tc, toolFeedbackMaxArgsLength),
+			),
 		})
 	}
 
 	return messages
+}
+
+func visibleAssistantToolFeedbackExplanation(
+	tc providers.ToolCall,
+	toolFeedbackMaxArgsLength int,
+) string {
+	if tc.ExtraContent != nil {
+		if explanation := strings.TrimSpace(tc.ExtraContent.ToolFeedbackExplanation); explanation != "" {
+			return utils.Truncate(explanation, toolFeedbackMaxArgsLength)
+		}
+	}
+	return ""
+}
+
+func visibleAssistantToolArgsPreview(
+	tc providers.ToolCall,
+	toolFeedbackMaxArgsLength int,
+) string {
+	argsJSON := ""
+	if tc.Function != nil {
+		argsJSON = tc.Function.Arguments
+	}
+	if strings.TrimSpace(argsJSON) == "" && len(tc.Arguments) > 0 {
+		if encodedArgs, err := json.MarshalIndent(tc.Arguments, "", "  "); err == nil {
+			argsJSON = string(encodedArgs)
+		}
+	}
+	argsJSON = strings.TrimSpace(argsJSON)
+	if argsJSON == "" {
+		return ""
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, []byte(argsJSON), "", "  "); err == nil {
+		argsJSON = pretty.String()
+	}
+
+	return utils.Truncate(argsJSON, toolFeedbackMaxArgsLength)
 }
 
 func visibleAssistantToolMessages(toolCalls []providers.ToolCall) []sessionChatMessage {
@@ -568,34 +803,51 @@ func visibleAssistantToolMessages(toolCalls []providers.ToolCall) []sessionChatM
 
 	messages := make([]sessionChatMessage, 0, len(toolCalls))
 	for _, tc := range toolCalls {
-		name := tc.Name
-		argsJSON := ""
-		if tc.Function != nil {
-			if name == "" {
-				name = tc.Function.Name
-			}
-			argsJSON = tc.Function.Arguments
+		name, argsJSON := toolCallNameAndArguments(tc)
+		if name != "message" {
+			continue
 		}
-
-		switch name {
-		case "message":
-			var args struct {
-				Content string `json:"content"`
-			}
-			if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-				continue
-			}
-			if strings.TrimSpace(args.Content) == "" {
-				continue
-			}
-			messages = append(messages, sessionChatMessage{
-				Role:    "assistant",
-				Content: args.Content,
-			})
+		content, ok := parseMessageToolContent(argsJSON)
+		if !ok {
+			continue
 		}
+		messages = append(messages, sessionChatMessage{
+			Role:    "assistant",
+			Content: content,
+		})
 	}
 
 	return messages
+}
+
+func toolCallNameAndArguments(tc providers.ToolCall) (string, string) {
+	name := tc.Name
+	argsJSON := ""
+	if tc.Function != nil {
+		if name == "" {
+			name = tc.Function.Name
+		}
+		argsJSON = tc.Function.Arguments
+	}
+	if strings.TrimSpace(argsJSON) == "" && len(tc.Arguments) > 0 {
+		if encodedArgs, err := json.Marshal(tc.Arguments); err == nil {
+			argsJSON = string(encodedArgs)
+		}
+	}
+	return name, argsJSON
+}
+
+func parseMessageToolContent(argsJSON string) (string, bool) {
+	var args struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", false
+	}
+	if strings.TrimSpace(args.Content) == "" {
+		return "", false
+	}
+	return args.Content, true
 }
 
 // sessionsDir resolves the path to the gateway's session storage directory.
@@ -761,7 +1013,7 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	messages := visibleSessionMessages(sess.Messages, toolFeedbackMaxArgsLength)
+	messages := detailSessionMessages(sess.Messages, toolFeedbackMaxArgsLength)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
