@@ -10,6 +10,7 @@ import (
 
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/providers/messageutil"
 	"github.com/sipeed/picoclaw/pkg/tools"
 )
 
@@ -462,7 +463,8 @@ func spawnSubTurn(
 	}()
 
 	// 8. Execute sub-turn via the real agent loop.
-	turnRes, turnErr := al.runTurn(childCtx, childTS)
+	pipeline := NewPipeline(al)
+	turnRes, turnErr := al.runTurn(childCtx, childTS, pipeline)
 
 	// Release the concurrency semaphore immediately after runTurn completes,
 	// before the cleanup defer runs. This prevents a deadlock where:
@@ -622,6 +624,10 @@ func (e *ephemeralSessionStore) AddMessage(_, role, content string) {
 }
 
 func (e *ephemeralSessionStore) AddFullMessage(_ string, msg providers.Message) {
+	if messageutil.IsTransientAssistantThoughtMessage(msg) {
+		return
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.history = append(e.history, msg)
@@ -651,6 +657,7 @@ func (e *ephemeralSessionStore) SetSummary(_, summary string) {
 func (e *ephemeralSessionStore) SetHistory(_ string, history []providers.Message) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	history = messageutil.FilterInvalidHistoryMessages(history)
 	e.history = make([]providers.Message, len(history))
 	copy(e.history, history)
 	e.truncateLocked()

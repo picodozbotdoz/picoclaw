@@ -36,7 +36,7 @@ docker compose -f docker/docker-compose.yml --profile gateway down
 
 ### Modo Launcher (Console Web)
 
-A imagem `launcher` inclui os três binários (`picoclaw`, `picoclaw-launcher`, `picoclaw-launcher-tui`) e inicia o console web por padrão, que fornece uma interface baseada em navegador para configuração e chat.
+A imagem `launcher` inclui ambos os binários (`picoclaw`, `picoclaw-launcher`) e inicia o console web por padrão, que fornece uma interface baseada em navegador para configuração e chat.
 
 ```bash
 docker compose -f docker/docker-compose.yml --profile launcher up -d
@@ -45,7 +45,7 @@ docker compose -f docker/docker-compose.yml --profile launcher up -d
 Abra http://localhost:18800 no seu navegador. O launcher gerencia o processo do gateway automaticamente.
 
 > [!WARNING]
-> O console web ainda não suporta autenticação. Evite expô-lo na internet pública.
+> O console web é protegido por senha de login do dashboard. Não exponha o launcher a redes não confiáveis nem à internet pública.
 
 ### Modo Agent (One-shot)
 

@@ -36,7 +36,7 @@ docker compose -f docker/docker-compose.yml --profile gateway down
 
 ### Launcher モード (Web コンソール)
 
-`launcher` イメージには 3 つのバイナリ（`picoclaw`、`picoclaw-launcher`、`picoclaw-launcher-tui`）がすべて含まれており、デフォルトで Web コンソールを起動します。ブラウザベースの設定・チャット画面を提供します。
+`launcher` イメージには 2 つのバイナリ（`picoclaw`、`picoclaw-launcher`）が含まれており、デフォルトで Web コンソールを起動します。ブラウザベースの設定・チャット画面を提供します。
 
 ```bash
 docker compose -f docker/docker-compose.yml --profile launcher up -d
@@ -45,7 +45,7 @@ docker compose -f docker/docker-compose.yml --profile launcher up -d
 ブラウザで http://localhost:18800 を開いてください。Launcher が Gateway プロセスを自動管理します。
 
 > [!WARNING]
-> Web コンソールはまだ認証をサポートしていません。公開インターネットに公開しないでください。
+> Web コンソールは dashboard ログインパスワードで保護されます。信頼できないネットワークや公開インターネットには公開しないでください。
 
 ### Agent モード (ワンショット)
 
