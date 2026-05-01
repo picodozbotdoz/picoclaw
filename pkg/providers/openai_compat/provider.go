@@ -144,7 +144,7 @@ func (p *Provider) buildRequestBody(
 
         requestBody := map[string]any{
                 "model":    model,
-                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages)),
+                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages, model)),
         }
 
         // When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
@@ -236,7 +236,7 @@ func (p *Provider) SetProviderName(providerName string) {
         p.providerName = strings.ToLower(strings.TrimSpace(providerName))
 }
 
-func (p *Provider) prepareMessagesForRequest(messages []Message) []Message {
+func (p *Provider) prepareMessagesForRequest(messages []Message, model string) []Message {
         if len(messages) == 0 {
                 return nil
         }
@@ -244,9 +244,9 @@ func (p *Provider) prepareMessagesForRequest(messages []Message) []Message {
         if p.isDeepSeekReasoningProvider() {
                 // DeepSeek V4 models (deepseek-v4-flash, deepseek-v4-pro) require
                 // reasoning_content to be preserved in multi-turn conversations per API docs.
-                // For V4 models, we only strip reasoning from non-tool turns without a
-                // tool interaction, as the model needs its prior reasoning context.
-                if p.isDeepSeekV4Model(messages) {
+                // For V4 models, we only strip transient thought-only messages that
+                // have no content or tool calls.
+                if isDeepSeekV4ModelName(model) {
                         return filterDeepSeekV4ReasoningMessages(messages)
                 }
                 return filterDeepSeekReasoningMessages(messages)
@@ -258,20 +258,9 @@ func (p *Provider) isDeepSeekReasoningProvider() bool {
         return p.providerName == "deepseek" || isDeepSeekHost(p.apiBase)
 }
 
-// isDeepSeekV4Model reports whether any assistant message in the conversation
-// comes from a DeepSeek V4 model (deepseek-v4-flash or deepseek-v4-pro).
-// V4 models require reasoning_content to be preserved in multi-turn.
-func (p *Provider) isDeepSeekV4Model(messages []Message) bool {
-        // If the provider is DeepSeek and the model name contains v4, treat as V4.
-        // We also check if any message has ReasoningContent, which is a strong
-        // signal that the model produced extended thinking output.
-        for _, msg := range messages {
-                if msg.Role == "assistant" && strings.TrimSpace(msg.ReasoningContent) != "" {
-                        return true
-                }
-        }
-        return false
-}
+// isDeepSeekV4Model is no longer used; V4 detection is now based on the
+// model name string via isDeepSeekV4ModelName, which is more reliable than
+// inferring V4 from message content.
 
 func isDeepSeekHost(apiBase string) bool {
         parsed, err := url.Parse(strings.TrimSpace(apiBase))
