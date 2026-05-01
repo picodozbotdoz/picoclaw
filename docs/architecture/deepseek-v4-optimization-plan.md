@@ -4,21 +4,21 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Draft |
+| Status | Draft (Revised after V4 PDF review) |
 | Branch | `wip/deepseekv4_optimized` |
 | Author | AI-assisted |
 | Created | 2026-05-01 |
-| Last Updated | 2026-05-01 |
+| Last Updated | 2026-05-01 (v2 — added DSML, Interleaved Thinking, Chat Prefix Completion, Strict Mode, Quick Instruction, response_format, reasoning_effort max system prompt) |
 
 ---
 
 ## 1. Executive Summary
 
-DeepSeek V4 introduces a **1,048,576-token context window** (1M), **automatic prefix caching** with 10x cost reduction on cache hits, **384K max output tokens**, and **three reasoning modes** (non-think, think-high, think-max). These capabilities fundamentally change how PicoClaw should manage context, prompt construction, token budgets, and the agent loop lifecycle.
+DeepSeek V4 introduces a **1,048,576-token context window** (1M), **automatic prefix caching** with 50x cost reduction on cache hits, **384K max output tokens**, **three reasoning modes** (non-think, think-high, think-max), **DSML (DeepSeek Markup Language)** for XML-based tool calls, **interleaved thinking** that preserves reasoning across tool-call boundaries, **Chat Prefix Completion** for guided generation, **strict mode** for deterministic tool output, and **Quick Instruction** tokens for auxiliary tasks. These capabilities fundamentally change how PicoClaw should manage context, prompt construction, token budgets, and the agent loop lifecycle.
 
-The current PicoClaw architecture was designed for models with 32K-128K context windows. It uses aggressive compression, heuristic token estimation, and treats all providers uniformly through an OpenAI-compatible abstraction. DeepSeek V4's scale demands a targeted optimization strategy that preserves the existing abstraction while exploiting V4's unique features: massive context, automatic caching, and reasoning mode control.
+The current PicoClaw architecture was designed for models with 32K-128K context windows. It uses aggressive compression, heuristic token estimation, and treats all providers uniformly through an OpenAI-compatible abstraction. DeepSeek V4's scale demands a targeted optimization strategy that preserves the existing abstraction while exploiting V4's unique features: massive context, automatic caching, reasoning mode control, DSML-based tool calling, and interleaved thinking.
 
-This plan proposes **8 workstreams** across **4 phases**, estimated at **6-8 weeks** of effort. Each workstream is independently mergeable with no breaking changes to existing provider integrations.
+This plan proposes **12 workstreams** across **5 phases**, estimated at **8-10 weeks** of effort. Each workstream is independently mergeable with no breaking changes to existing provider integrations.
 
 ---
 
@@ -68,6 +68,93 @@ Think Max requires >= 384K context window allocation. Responses include `reasoni
 - **Tool calling**: OpenAI-style function calling, max 128 functions, parallel tool calls supported
 - **Streaming**: SSE with `stream_options.include_usage: true` for token usage stats
 - **Deprecated**: `frequency_penalty` and `presence_penalty` have no effect
+- **JSON Output**: `response_format: { "type": "json_object" }` forces valid JSON output
+- **Anthropic API compatibility**: DeepSeek also offers an Anthropic-compatible API endpoint for migration ease
+
+### 2.6 DSML (DeepSeek Markup Language)
+
+DeepSeek V4 introduces a new XML-based tool-call schema called **DSML** that replaces the previous JSON-only format. While the DeepSeek API accepts OpenAI-compatible `tools`/`tool_choice` parameters and returns structured `tool_calls` in the response, the model internally uses DSML encoding.
+
+**DSML tool-call format** (internal model representation):
+```xml
+<|DSML|tool_calls>
+<|DSML|invoke name="$TOOL_NAME">
+<|DSML|parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</|DSML|parameter>
+...
+</|DSML|invoke>
+</|DSML|tool_calls>
+```
+
+Key rules:
+- `string="true"`: Parameter value is a raw string
+- `string="false"`: Parameter value is JSON (number, boolean, array, object)
+- Tool results are wrapped in `<tool_result>` tags within user messages
+- When thinking mode is enabled, reasoning MUST appear inside `<think...</think` BEFORE any DSML tool calls
+- DSML effectively mitigates escaping failures and reduces tool-call errors vs. JSON-based formats
+
+**Implication for PicoClaw**: The API translates between DSML and OpenAI-compatible function calling format, so PicoClaw can continue using OpenAI-style tool definitions. However, when working with raw model outputs (e.g., local inference, vLLM), PicoClaw must parse DSML-formatted responses directly.
+
+### 2.7 Interleaved Thinking
+
+DeepSeek V4 refines the thinking management strategy from V3.2 with two distinct behaviors:
+
+1. **Tool-Calling Scenarios**: ALL reasoning content is fully preserved throughout the entire conversation, including across user message boundaries. Unlike V3.2 which discarded thinking traces upon each new user turn, V4 retains the complete reasoning history across all rounds when tools are present. This allows the model to maintain a coherent, cumulative chain of thought over long-horizon agent tasks.
+
+2. **General Conversational Scenarios**: Reasoning content from previous turns is discarded when a new user message arrives, keeping the context concise for settings where persistent reasoning traces provide limited benefit.
+
+The `drop_thinking` encoding parameter controls this behavior:
+- `drop_thinking=True` (default for non-tool conversations): Strip reasoning from earlier turns
+- `drop_thinking=False` (automatic when tools are present): Preserve all reasoning content
+
+**Implication for PicoClaw**: When tools are defined on the system message, PicoClaw MUST NOT strip `reasoning_content` from any turn. The current `filterDeepSeekReasoningMessages()` function must be aware of whether tools are present in the conversation context.
+
+### 2.8 Chat Prefix Completion (Beta)
+
+Allows pre-seeding the assistant's response to guide generation. Uses the `prefix: true` parameter on an assistant message to force the model to complete from that prefix.
+
+- **Beta endpoint**: `base_url="https://api.deepseek.com/beta"`
+- **Use cases**: Force code output format (e.g., prefix with `` ```python\n ``), guide structured responses, implement constrained generation
+- **Thinking mode integration**: The `reasoning_content` field on the last assistant message can be used as a CoT prefix input
+- **Stop sequences**: Combine with `stop` parameter for precise output control
+
+### 2.9 Strict Mode for Tool Calls (Beta)
+
+When `strict: true` is set on a function definition, the API validates that tool call outputs conform exactly to the function's JSON Schema. This eliminates malformed tool invocations.
+
+- **Beta endpoint**: `base_url="https://api.deepseek.com/beta"`
+- **Requirements**: All properties must be in `required`, `additionalProperties: false` on every object
+- **Supported schema types**: `object`, `string`, `number`, `integer`, `boolean`, `array`, `enum`, `anyOf`
+- **Works in both**: Thinking and non-thinking modes
+- **Validation**: Server-side schema validation rejects invalid schemas with error messages
+
+### 2.10 Quick Instruction Tokens
+
+Special tokens appended to messages for auxiliary classification and generation tasks. These tokens leverage the already-computed KV cache, avoiding redundant prefilling and reducing TTFT.
+
+| Token | Purpose | Format |
+|-------|---------|--------|
+| `<\|action\|>` | Route: web search vs. direct answer | `...<\|User\|>{prompt}<\|Assistant\|><think<\|action\|>` |
+| `<\|title\|>` | Generate conversation title | `...<\|Assistant\|>{response}<\|end_of_sentence\|><\|title\|>` |
+| `<\|query\|>` | Generate search queries | `...<\|User\|>{prompt}<\|query\|>` |
+| `<\|authority\|>` | Classify source authoritativeness | `...<\|User\|>{prompt}<\|authority\|>` |
+| `<\|domain\|>` | Identify prompt domain | `...<\|User\|>{prompt}<\|domain\|>` |
+| `<\|extracted_url\|><\|read_url\|>` | URL fetch decision | `...<\|User\|>{prompt}<\|extracted_url\|>{url}<\|read_url\|>` |
+
+### 2.11 Reasoning Effort: Max Mode System Prompt Injection
+
+When `reasoning_effort: "max"` is set, the API automatically prepends a special system prompt instruction at the very beginning of the conversation (before the user's system prompt):
+
+```
+Reasoning Effort: Absolute maximum with no shortcuts permitted.
+You MUST be very thorough in your thinking and comprehensively decompose the
+problem to resolve the root cause, rigorously stress-testing your logic against all
+potential paths, edge cases, and adversarial scenarios.
+Explicitly write out your entire deliberation process, documenting every intermediate
+step, considered alternative, and rejected hypothesis to ensure absolutely no
+assumption is left unchecked.
+```
+
+**Implication for PicoClaw**: This prefix is managed server-side by the API. PicoClaw should NOT inject this text manually. However, PicoClaw must account for the extra tokens this prefix adds to the prompt when calculating context budgets.
 
 ---
 
@@ -137,6 +224,46 @@ Think Max requires >= 384K context window allocation. Responses include `reasoni
 
 **Files affected**: `pkg/agent/context.go`, `pkg/agent/context_usage.go`
 
+### 3.9 No DSML Tool-Call Parsing
+
+**Current**: PicoClaw assumes all providers return tool calls in OpenAI-compatible JSON format (`tool_calls` array with `function.name` and `function.arguments`). DeepSeek V4's internal DSML format is not handled.
+
+**Impact**: When using local inference (vLLM, Ollama) with DeepSeek V4 models, the model output may contain DSML-formatted tool calls (`<|DSML|tool_calls>...`) instead of structured JSON. PicoClaw cannot parse these, breaking the agent loop for local deployments. Even when using the cloud API, understanding DSML is important for debugging raw model outputs and for parsing `reasoning_content` that may contain partial DSML fragments.
+
+**Files affected**: `pkg/providers/openai_compat/provider.go`, `pkg/providers/openai_compat/dsml_parser.go` (new)
+
+### 3.10 Interleaved Thinking Not Properly Handled
+
+**Current**: `filterDeepSeekReasoningMessages()` strips `reasoning_content` based on whether the turn involves tool interactions, but it does not consider the V4 distinction between tool-call scenarios (preserve all reasoning) and general chat scenarios (drop earlier reasoning).
+
+**Impact**: In V4, when tools are present, ALL reasoning content across ALL turns (including across user message boundaries) must be preserved. The current code may still strip reasoning inappropriately, breaking V4's interleaved thinking mechanism. This degrades the model's ability to maintain coherent reasoning over multi-step agent tasks.
+
+**Files affected**: `pkg/providers/openai_compat/provider.go`, `pkg/agent/pipeline_llm.go`
+
+### 3.11 No Chat Prefix Completion Support
+
+**Current**: PicoClaw has no mechanism to pre-seed assistant responses using the `prefix: true` parameter.
+
+**Impact**: Chat Prefix Completion enables guided generation patterns (e.g., forcing code output format, constraining JSON structure) that reduce prompt engineering complexity and improve output reliability. Without it, PicoClaw relies solely on prompt instructions for format control, which is less reliable.
+
+**Files affected**: `pkg/providers/openai_compat/provider.go`, `pkg/agent/pipeline_llm.go`
+
+### 3.12 No Strict Mode for Tool Calls
+
+**Current**: Tool function definitions are sent without the `strict: true` parameter, meaning the model's tool call outputs are not validated against the JSON Schema.
+
+**Impact**: Without strict mode, tool calls may occasionally produce malformed JSON arguments (missing fields, wrong types), causing runtime errors in tool execution. Strict mode would eliminate this class of errors entirely, which is critical for autonomous agent workflows where a single malformed tool call can derail the entire task.
+
+**Files affected**: `pkg/providers/openai_compat/provider.go`, `pkg/tools/registry.go`
+
+### 3.13 No JSON Output Mode Support
+
+**Current**: PicoClaw does not send `response_format: { "type": "json_object" }` in API requests.
+
+**Impact**: Some PicoClaw features (structured data extraction, tool argument parsing) would benefit from guaranteed JSON output. Without this, the model may generate freeform text when JSON is expected, requiring additional parsing and error handling.
+
+**Files affected**: `pkg/providers/openai_compat/provider.go`, `pkg/agent/pipeline_llm.go`
+
 ---
 
 ## 4. Optimization Plan
@@ -170,6 +297,8 @@ These changes establish the infrastructure for DeepSeek V4 optimization without 
    - Remove or conditionally bypass `filterDeepSeekReasoningMessages()` for V4 models
    - Store `reasoning_content` in `providers.Message.ReasoningContent` field (already exists)
    - Ensure `reasoning_content` is included in assistant messages sent back to the API
+   - **Interleaved thinking**: When tools are present in the system message, preserve ALL `reasoning_content` across ALL turns (including across user message boundaries). This implements V4's "tool-calling scenario" behavior where the model maintains a cumulative chain of thought
+   - When no tools are present, apply the `drop_thinking` behavior: strip reasoning from turns before the last user message, preserving only the most recent assistant turn's reasoning
 
 4. **Add `user_id` parameter support**:
    - Pass `user_id` in the request body for KV cache isolation in multi-tenant scenarios
@@ -582,6 +711,157 @@ These changes add DeepSeek V4-specific features that go beyond basic optimizatio
 
 ---
 
+### Phase 5: DSML & Advanced V4 Features (Weeks 9-10)
+
+These changes add DeepSeek V4-specific features discovered during PDF documentation review: DSML tool-call parsing, Chat Prefix Completion, strict mode for tool calls, and JSON output mode support.
+
+---
+
+#### Workstream 5.1: DSML Tool-Call Parser
+
+**Goal**: Implement a parser for DeepSeek V4's DSML (DeepSeek Markup Language) tool-call format, enabling compatibility with both cloud API and local inference deployments.
+
+**Changes**:
+
+1. **Create `pkg/providers/openai_compat/dsml_parser.go`**:
+   - Implement `ParseDSMLToolCalls(content string) ([]ToolCall, error)` that extracts tool calls from DSML-formatted text:
+     ```
+     <|DSML|tool_calls>
+     <|DSML|invoke name="function_name">
+     <|DSML|parameter name="param" string="true">string_value</|DSML|parameter>
+     <|DSML|parameter name="count" string="false">5</|DSML|parameter>
+     </|DSML|invoke>
+     </|DSML|tool_calls>
+     ```
+   - Parse each `<|DSML|invoke>` block into a structured `ToolCall` with `name` and `arguments` (JSON object)
+   - For `string="true"` parameters: wrap the raw value in JSON as a string
+   - For `string="false"` parameters: parse the value as JSON directly
+   - Handle multiple `<|DSML|invoke>` blocks within a single `<|DSML|tool_calls>` block
+
+2. **Create `pkg/providers/openai_compat/dsml_parser_test.go`**:
+   - Test single tool call with string and non-string parameters
+   - Test multiple tool calls in a single DSML block
+   - Test nested JSON parameters (arrays, objects)
+   - Test malformed DSML (unclosed tags, missing attributes)
+   - Test DSML intermixed with regular text content
+   - Test DSML within `reasoning_content` (should be preserved as-is)
+
+3. **Integrate DSML parser into response processing** in `pkg/providers/openai_compat/provider.go`:
+   - After receiving a response, check if `content` contains `<|DSML|tool_calls>` markers
+   - If DSML markers are found AND `tool_calls` array is empty, parse DSML to populate `tool_calls`
+   - This handles the case where local inference engines return DSML instead of structured JSON
+   - For cloud API responses, the `tool_calls` array is already populated; DSML parsing is a fallback
+
+4. **Add DSML-aware debug logging**:
+   - When DSML content is detected in a response, log at debug level with the parsed tool calls
+   - This helps with debugging local inference deployments
+
+**Acceptance criteria**:
+- DSML-formatted tool calls are correctly parsed into OpenAI-compatible `ToolCall` structures
+- Cloud API responses work unchanged (DSML parsing is fallback only)
+- Local inference responses with DSML format are correctly handled
+- Parser handles edge cases (malformed XML, mixed content, nested parameters)
+
+---
+
+#### Workstream 5.2: Chat Prefix Completion Support
+
+**Goal**: Enable PicoClaw to use DeepSeek V4's Chat Prefix Completion feature for guided generation.
+
+**Changes**:
+
+1. **Add `PrefixCompletion` option to `ProviderOptions`** in `pkg/providers/openai_compat/provider.go`:
+   - New option: `prefix_completion_content string` — content to use as the assistant prefix
+   - When set, the last assistant message in the request will have `prefix: true`
+   - Requires using the beta endpoint: `base_url="https://api.deepseek.com/beta"`
+
+2. **Implement prefix completion in request builder**:
+   - Append an assistant message with the prefix content and `prefix: true`
+   - Optionally set `stop` sequences to control where generation ends
+   - Example: Force Python code output by setting prefix to `` ```python\n `` and stop to `` ``` ``
+
+3. **Add `reasoning_content` prefix support**:
+   - The `reasoning_content` field on the last assistant message can serve as a CoT prefix
+   - When `thinking_mode` is enabled, allow providing both `reasoning_content` and content prefix
+   - This enables "guided reasoning" where the model continues from a partially-written reasoning chain
+
+4. **Add beta endpoint detection**:
+   - When prefix completion is requested, automatically switch to `https://api.deepseek.com/beta`
+   - Log a warning that beta features are being used
+   - Fall back gracefully if beta endpoint returns errors
+
+**Acceptance criteria**:
+- Prefix completion can be used to guide output format
+- Beta endpoint is used automatically when needed
+- Regular (non-prefix) completions are unaffected
+- Works with both thinking and non-thinking modes
+
+---
+
+#### Workstream 5.3: Strict Mode for Tool Calls
+
+**Goal**: Enable strict mode for DeepSeek V4 tool calls to guarantee schema-conformant output.
+
+**Changes**:
+
+1. **Add `StrictToolCalls` option to `ModelConfig`** in `pkg/config/config_struct.go`:
+   - When `true`, all tool function definitions sent to DeepSeek V4 will include `strict: true`
+   - Default: `false` (backward compatible)
+
+2. **Implement strict mode in request builder** in `pkg/providers/openai_compat/provider.go`:
+   - When `StrictToolCalls` is enabled for a DeepSeek V4 model:
+     - Add `"strict": true` to each function definition in the `tools` array
+     - Ensure all object schemas have `additionalProperties: false` and all properties in `required`
+     - Validate schemas locally before sending; log warnings for non-compliant schemas
+   - Use beta endpoint: `base_url="https://api.deepseek.com/beta"`
+
+3. **Add schema validation helper** in `pkg/tools/schema_validator.go` (new):
+   - Validate that tool parameter schemas conform to strict mode requirements
+   - Check: all object properties are in `required`, `additionalProperties: false` on every object
+   - Supported types: `object`, `string`, `number`, `integer`, `boolean`, `array`, `enum`, `anyOf`
+   - Return validation errors with actionable messages (e.g., "property 'name' missing from required array")
+
+4. **Handle strict mode validation errors**:
+   - If the API returns a schema validation error, log the error with the specific function and parameter
+   - Fall back to non-strict mode for that function and retry
+   - This prevents a single non-compliant schema from blocking the entire request
+
+**Acceptance criteria**:
+- Strict mode guarantees schema-conformant tool call output
+- Non-compliant schemas are detected and reported before API submission
+- Fallback to non-strict mode works gracefully
+- Existing tool definitions work unchanged when strict mode is disabled
+
+---
+
+#### Workstream 5.4: JSON Output Mode
+
+**Goal**: Support DeepSeek V4's `response_format` parameter for guaranteed JSON output.
+
+**Changes**:
+
+1. **Add `ResponseFormat` option to `ProviderOptions`** in `pkg/providers/openai_compat/provider.go`:
+   - New option: `response_format string` — `"text"` (default) or `"json_object"`
+   - When `"json_object"`, add `response_format: { "type": "json_object" }` to the request body
+
+2. **Integrate with agent pipeline**:
+   - Certain tools or pipeline stages can request JSON output mode (e.g., structured data extraction)
+   - When JSON output mode is active, ensure the system or user message includes JSON formatting instructions (required by the API)
+   - Add validation that the response is valid JSON before processing
+
+3. **Add `ResponseFormat` to `ModelConfig`**:
+   - Optional field: `response_format string`
+   - When set at config level, applies to all requests for that model
+   - Can be overridden per-request in pipeline options
+
+**Acceptance criteria**:
+- JSON output mode forces valid JSON responses
+- System prompt includes JSON instructions when mode is active
+- Response validation catches non-JSON output gracefully
+- Default behavior (text mode) is unchanged
+
+---
+
 ## 5. Implementation Order and Dependencies
 
 ```
@@ -602,9 +882,15 @@ Phase 4: Advanced Features
 ├── 4.1 Full-Context Codebase Loading ───────────── [depends on 3.3]
 ├── 4.2 Cost-Aware Model Routing ────────────────── [depends on 3.1, 4.3]
 └── 4.3 Enhanced Token Usage Tracking ───────────── [depends on 3.2]
+
+Phase 5: DSML & Advanced V4 Features
+├── 5.1 DSML Tool-Call Parser ───────────────────── [depends on 1.1]
+├── 5.2 Chat Prefix Completion ──────────────────── [depends on 1.1]
+├── 5.3 Strict Mode for Tool Calls ──────────────── [depends on 1.1, 5.1]
+└── 5.4 JSON Output Mode ────────────────────────── [depends on 1.1]
 ```
 
-Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstreams 2.1 and 2.2 are also parallelizable given their Phase 1 dependencies are met.
+Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstreams 2.1 and 2.2 are also parallelizable given their Phase 1 dependencies are met. Phase 5 workstreams 5.1, 5.2, and 5.4 can be developed in parallel; 5.3 depends on 5.1 (DSML parser needed for strict mode integration testing).
 
 ---
 
@@ -618,6 +904,9 @@ Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstream
 | Token estimation inaccuracy leads to context overflow | Medium | Medium | Use API-reported usage (Workstream 3.2) as primary; keep heuristic as fallback |
 | Reasoning content bloats session storage | Medium | Low | Add optional `reasoning_content` compression; cap stored reasoning per turn |
 | Cost overrun from uncontrolled output generation | Medium | High | Always set `max_tokens` explicitly; add per-session cost budgets (Workstream 4.2) |
+| DSML parsing errors on malformed model output | Medium | Medium | Comprehensive test coverage; graceful fallback to raw text; log DSML parse failures |
+| Beta API features (prefix completion, strict mode) may change | Medium | Medium | Feature-gate behind config flags; document as beta; provide fallback paths |
+| Interleaved thinking increases token usage significantly | High | Medium | Track reasoning token costs; add budget limits for reasoning tokens per session |
 
 ---
 
@@ -630,6 +919,11 @@ Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstream
 - Adaptive compression threshold calculation
 - Context partition budget enforcement
 - Message ordering for cache stability
+- DSML tool-call parsing (single, multiple, malformed, mixed content)
+- Strict mode schema validation
+- JSON output mode request construction
+- Chat prefix completion request construction
+- Interleaved thinking: reasoning preservation when tools present vs. absent
 
 ### Integration Tests
 
@@ -638,6 +932,10 @@ Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstream
 - Streaming with tool calls
 - Prefix cache hit rate measurement (requires sequential calls)
 - Context injection and budget management
+- DSML-formatted response parsing from local inference
+- Strict mode tool calls with schema validation
+- Chat prefix completion with guided output
+- JSON output mode with response validation
 
 ### Load Tests
 
@@ -699,7 +997,8 @@ Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstream
       "api_key": "${DEEPSEEK_API_KEY}",
       "max_tokens": 32768,
       "context_window": 1048576,
-      "thinking_level": "high"
+      "thinking_level": "high",
+      "strict_tool_calls": true
     }
   ],
   "defaults": {
@@ -724,20 +1023,44 @@ Workstreams 1.1 and 1.2 can be developed in parallel. Within Phase 2, workstream
 }
 ```
 
+### Configuration with Advanced V4 Features
+
+```json
+{
+  "models": [
+    {
+      "name": "deepseek-v4-pro-strict",
+      "model": "deepseek/deepseek-v4-pro",
+      "api_base": "https://api.deepseek.com/beta",
+      "api_key": "${DEEPSEEK_API_KEY}",
+      "max_tokens": 32768,
+      "context_window": 1048576,
+      "thinking_level": "high",
+      "strict_tool_calls": true,
+      "response_format": "json_object"
+    }
+  ]
+}
+```
+
 ---
 
 ## 9. Success Metrics
 
-| Metric | Current Baseline | Target (After Phase 4) |
+| Metric | Current Baseline | Target (After Phase 5) |
 |--------|-----------------|----------------------|
 | Max effective context on DeepSeek V4 | ~128K (heuristic limit) | 1M (full window) |
 | Prefix cache hit rate | N/A (not measured) | > 60% for sequential calls |
 | Compression trigger (1M context) | ~20 messages | ~375 messages (adaptive) |
-| Reasoning content preservation | Stripped | Fully preserved |
+| Reasoning content preservation | Stripped | Fully preserved (with interleaved thinking) |
 | Thinking mode control | Fixed per-session | Dynamic per-iteration |
 | Token estimation accuracy | ~60-80% (heuristic) | > 95% (API-reported) |
 | Time-to-first-token | Full response wait | < 2 seconds (streaming) |
 | Cost per 10-turn session (V4-Flash) | ~$0.14 (no caching) | ~$0.03 (with caching + adaptive thinking) |
+| DSML tool-call parsing | Not supported | Full support (local + cloud) |
+| Strict mode tool calls | Not supported | Schema-validated tool output |
+| Chat prefix completion | Not supported | Guided generation for code/structured output |
+| JSON output mode | Not supported | Guaranteed JSON responses |
 
 ---
 
@@ -751,3 +1074,8 @@ The following are explicitly excluded from this plan:
 - **Batch processing**: DeepSeek does not offer a batch API; implementing a custom batch queue is out of scope.
 - **On-premise deployment**: The plan targets the DeepSeek V4 cloud API. Local deployment optimizations are a separate concern.
 - **Web UI changes**: The web frontend (`web/`) does not require changes for V4 optimization. Context usage display will use existing `ContextUsage` fields.
+- **Quick Instruction tokens**: The `<|action|>`, `<|title|>`, `<|query|>`, `<|authority|>`, `<|domain|>`, `<|extracted_url|>`, and `<|read_url|>` tokens are DeepSeek's internal pipeline tokens for chatbot auxiliary tasks. They are documented in Section 2.10 for reference, but implementing them in PicoClaw is out of scope because PicoClaw does not run a chatbot UI with search/title generation features. If needed in the future, they would be a separate feature.
+- **`developer` role**: The `developer` message role is used exclusively in DeepSeek's internal search agent pipeline. The official API does not accept messages with this role. PicoClaw should not send `developer`-role messages.
+- **`latest_reminder` role**: The `latest_reminder` role injects date/locale context. PicoClaw handles this differently via its own system prompt construction, so the V4-specific role is not needed.
+- **Anthropic API compatibility endpoint**: DeepSeek offers an Anthropic-compatible API, but PicoClaw already has a native Anthropic provider implementation, so using the DeepSeek Anthropic wrapper provides no benefit.
+- **FIM (Fill-In-the-Middle) Completion**: This is a separate beta feature for code completion tasks, not chat-based coding assistance. May be reconsidered if PicoClaw adds inline code completion features.
