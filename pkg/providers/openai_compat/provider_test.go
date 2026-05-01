@@ -1854,3 +1854,348 @@ func TestSerializeMessages_StripsSystemParts(t *testing.T) {
                 t.Fatal("system_parts should not appear in serialized output")
         }
 }
+
+func TestProviderChat_StrictToolCalls(t *testing.T) {
+        var requestBody map[string]any
+
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+                        http.Error(w, err.Error(), http.StatusBadRequest)
+                        return
+                }
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message":       map[string]any{"content": "ok"},
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+
+        tools := []ToolDefinition{
+                {
+                        Type: "function",
+                        Function: ToolFunctionDefinition{
+                                Name:        "get_weather",
+                                Description: "Get weather",
+                                Parameters: map[string]any{
+                                        "type": "object",
+                                        "properties": map[string]any{
+                                                "location": map[string]any{"type": "string"},
+                                },
+                                        "required":             []string{"location"},
+                                        "additionalProperties": false,
+                                },
+                        },
+                },
+        }
+
+        _, err := p.Chat(
+                t.Context(),
+                []Message{{Role: "user", Content: "weather?"}},
+                tools,
+                "deepseek-v4-flash",
+                map[string]any{"strict_tool_calls": true},
+        )
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        toolsList, ok := requestBody["tools"].([]any)
+        if !ok {
+                t.Fatalf("tools is not []any: %T", requestBody["tools"])
+        }
+        if len(toolsList) != 1 {
+                t.Fatalf("len(tools) = %d, want 1", len(toolsList))
+        }
+
+        toolDef, ok := toolsList[0].(map[string]any)
+        if !ok {
+                t.Fatalf("tool is not map[string]any: %T", toolsList[0])
+        }
+
+        fn, ok := toolDef["function"].(map[string]any)
+        if !ok {
+                t.Fatalf("function is not map[string]any: %T", toolDef["function"])
+        }
+
+        if fn["strict"] != true {
+                t.Fatalf("strict = %v, want true", fn["strict"])
+        }
+}
+
+func TestProviderChat_ResponseFormatJSON(t *testing.T) {
+        var requestBody map[string]any
+
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+                        http.Error(w, err.Error(), http.StatusBadRequest)
+                        return
+                }
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message":       map[string]any{"content": `{"result": "ok"}`},
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+
+        _, err := p.Chat(
+                t.Context(),
+                []Message{{Role: "user", Content: "give me JSON"}},
+                nil,
+                "deepseek-v4-flash",
+                map[string]any{"response_format": "json_object"},
+        )
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        responseFmt, ok := requestBody["response_format"].(map[string]any)
+        if !ok {
+                t.Fatalf("response_format is not map[string]any: %T", requestBody["response_format"])
+        }
+        if responseFmt["type"] != "json_object" {
+                t.Fatalf("response_format.type = %v, want json_object", responseFmt["type"])
+        }
+}
+
+func TestProviderChat_PrefixCompletion(t *testing.T) {
+        var requestBody map[string]any
+
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+                        http.Error(w, err.Error(), http.StatusBadRequest)
+                        return
+                }
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message":       map[string]any{"content": "def hello(): pass"},
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+
+        _, err := p.Chat(
+                t.Context(),
+                []Message{{Role: "user", Content: "write python code"}},
+                nil,
+                "deepseek-v4-pro",
+                map[string]any{"prefix_completion": "```python\n"},
+        )
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        reqMessages, ok := requestBody["messages"].([]any)
+        if !ok {
+                t.Fatalf("messages is not []any: %T", requestBody["messages"])
+        }
+
+        // Last message should be an assistant message with prefix: true
+        lastMsg, ok := reqMessages[len(reqMessages)-1].(map[string]any)
+        if !ok {
+                t.Fatalf("last message is not map[string]any: %T", reqMessages[len(reqMessages)-1])
+        }
+        if lastMsg["role"] != "assistant" {
+                t.Fatalf("last message role = %v, want assistant", lastMsg["role"])
+        }
+        if lastMsg["prefix"] != true {
+                t.Fatalf("last message prefix = %v, want true", lastMsg["prefix"])
+        }
+        if lastMsg["content"] != "```python\n" {
+                t.Fatalf("last message content = %v, want ```python\\n", lastMsg["content"])
+        }
+}
+
+func TestProviderChat_V4InterleavedThinking_WithTools(t *testing.T) {
+        // V4 models always preserve reasoning_content in all turns by default.
+        // This is the safe and recommended behavior per V4 API docs.
+        var requestBody map[string]any
+
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+                        http.Error(w, err.Error(), http.StatusBadRequest)
+                        return
+                }
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message":       map[string]any{"content": "ok"},
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+        p.SetProviderName("deepseek")
+
+        tools := []ToolDefinition{
+                {
+                        Type: "function",
+                        Function: ToolFunctionDefinition{
+                                Name:        "search",
+                                Description: "Search the web",
+                        },
+                },
+        }
+
+        messages := []Message{
+                {Role: "user", Content: "Who wrote The Hobbit?"},
+                {Role: "assistant", Content: "J.R.R. Tolkien.", ReasoningContent: "I know this from general knowledge."},
+                {Role: "user", Content: "Tell me more"},
+        }
+
+        _, err := p.Chat(t.Context(), messages, tools, "deepseek-v4-flash", nil)
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        reqMessages, ok := requestBody["messages"].([]any)
+        if !ok {
+                t.Fatalf("messages is not []any: %T", requestBody["messages"])
+        }
+
+        // With tools present, reasoning should be preserved in all turns
+        assistantMsg, ok := reqMessages[1].(map[string]any)
+        if !ok {
+                t.Fatalf("assistant message is not map[string]any: %T", reqMessages[1])
+        }
+        if assistantMsg["reasoning_content"] != "I know this from general knowledge." {
+                t.Fatalf("V4 with tools: reasoning_content should be preserved, got %v", assistantMsg["reasoning_content"])
+        }
+}
+
+func TestProviderChat_V4InterleavedThinking_NoTools(t *testing.T) {
+        // V4 models preserve reasoning_content in all turns even without tools.
+        // The drop_thinking behavior from the V4 paper is an optimization that
+        // can be applied when token savings are needed, but the default behavior
+        // is to preserve all reasoning for best quality.
+        var requestBody map[string]any
+
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+                        http.Error(w, err.Error(), http.StatusBadRequest)
+                        return
+                }
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message":       map[string]any{"content": "ok"},
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+        p.SetProviderName("deepseek")
+
+        messages := []Message{
+                {Role: "user", Content: "Who wrote The Hobbit?"},
+                {Role: "assistant", Content: "J.R.R. Tolkien.", ReasoningContent: "I know this from general knowledge."},
+                {Role: "user", Content: "What about The Lord of the Rings?"},
+                {Role: "assistant", Content: "Also J.R.R. Tolkien.", ReasoningContent: "Same author, different book."},
+                {Role: "user", Content: "Thanks!"},
+        }
+
+        _, err := p.Chat(t.Context(), messages, nil, "deepseek-v4-flash", nil)
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        reqMessages, ok := requestBody["messages"].([]any)
+        if !ok {
+                t.Fatalf("messages is not []any: %T", requestBody["messages"])
+        }
+
+        // First assistant turn: reasoning should be preserved (V4 default)
+        firstAssistant, ok := reqMessages[1].(map[string]any)
+        if !ok {
+                t.Fatalf("first assistant message is not map[string]any: %T", reqMessages[1])
+        }
+        if firstAssistant["reasoning_content"] != "I know this from general knowledge." {
+                t.Fatalf("V4 no tools: reasoning_content should be preserved by default, got %v", firstAssistant["reasoning_content"])
+        }
+
+        // Second assistant turn: reasoning should also be preserved (V4 default)
+        secondAssistant, ok := reqMessages[3].(map[string]any)
+        if !ok {
+                t.Fatalf("second assistant message is not map[string]any: %T", reqMessages[3])
+        }
+        if secondAssistant["reasoning_content"] != "Same author, different book." {
+                t.Fatalf("V4 no tools: reasoning_content should be preserved by default, got %v", secondAssistant["reasoning_content"])
+        }
+}
+
+func TestProviderChat_DSMLResponseParsing(t *testing.T) {
+        // Test that DSML-formatted tool calls in the response content are
+        // parsed into structured ToolCall objects when the API doesn't return
+        // structured tool_calls (e.g., local inference).
+        server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+                resp := map[string]any{
+                        "choices": []map[string]any{
+                                {
+                                        "message": map[string]any{
+                                                "content": `<|DSML|tool_calls>
+<|DSML|invoke name="read_file">
+<|DSML|parameter name="path" string="true">/tmp/test.go</|DSML|parameter>
+</|DSML|invoke>
+</|DSML|tool_calls>`,
+                                        },
+                                        "finish_reason": "stop",
+                                },
+                        },
+                }
+                w.Header().Set("Content-Type", "application/json")
+                json.NewEncoder(w).Encode(resp)
+        }))
+        defer server.Close()
+
+        p := NewProvider("key", server.URL, "")
+        out, err := p.Chat(t.Context(), []Message{{Role: "user", Content: "read test.go"}}, nil, "deepseek-v4-flash", nil)
+        if err != nil {
+                t.Fatalf("Chat() error = %v", err)
+        }
+
+        if len(out.ToolCalls) != 1 {
+                t.Fatalf("len(ToolCalls) = %d, want 1 (parsed from DSML)", len(out.ToolCalls))
+        }
+        if out.ToolCalls[0].Name != "read_file" {
+                t.Fatalf("ToolCalls[0].Name = %q, want %q", out.ToolCalls[0].Name, "read_file")
+        }
+        if out.ToolCalls[0].Arguments["path"] != "/tmp/test.go" {
+                t.Fatalf("ToolCalls[0].Arguments[path] = %v, want /tmp/test.go", out.ToolCalls[0].Arguments["path"])
+        }
+        // Content should have DSML blocks removed
+        if out.Content != "" && strings.Contains(out.Content, "<|DSML|") {
+                t.Fatalf("Content should have DSML blocks removed, got: %q", out.Content)
+        }
+}

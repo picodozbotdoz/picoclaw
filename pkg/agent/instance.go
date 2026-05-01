@@ -35,6 +35,8 @@ type AgentInstance struct {
         ContextWindow             int
         SummarizeMessageThreshold int
         SummarizeTokenPercent     int
+        StrictToolCalls           bool
+        ResponseFormat            string
         Provider                  providers.LLMProvider
         Sessions                  session.SessionStore
         ContextBuilder            *ContextBuilder
@@ -172,6 +174,14 @@ func NewAgentInstance(
                 maxTokens = maxOutputTokens
         }
 
+        // DeepSeek V4 strict mode for tool calls and response format.
+        var strictToolCalls bool
+        var responseFormat string
+        if mc, err := cfg.GetModelConfig(model); err == nil {
+                strictToolCalls = mc.StrictToolCalls
+                responseFormat = mc.ResponseFormat
+        }
+
         contextWindow := defaults.ContextWindow
         if contextWindow == 0 {
                 // Check if the resolved model config specifies a model-level context window.
@@ -286,6 +296,8 @@ func NewAgentInstance(
                 ContextWindow:             contextWindow,
                 SummarizeMessageThreshold: summarizeMessageThreshold,
                 SummarizeTokenPercent:     summarizeTokenPercent,
+                StrictToolCalls:           strictToolCalls,
+                ResponseFormat:            responseFormat,
                 Provider:                  provider,
                 Sessions:                  sessions,
                 ContextBuilder:            contextBuilder,

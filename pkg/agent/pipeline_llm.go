@@ -81,6 +81,14 @@ func (p *Pipeline) CallLLM(
                                 map[string]any{"agent_id": ts.agent.ID, "thinking_level": string(ts.agent.ThinkingLevel)})
                 }
         }
+        // DeepSeek V4 strict mode for tool calls (Beta).
+        if ts.agent.StrictToolCalls {
+                exec.llmOpts["strict_tool_calls"] = true
+        }
+        // DeepSeek V4 response format (json_object for guaranteed JSON output).
+        if ts.agent.ResponseFormat != "" {
+                exec.llmOpts["response_format"] = ts.agent.ResponseFormat
+        }
 
         exec.llmModel = exec.activeModel
 

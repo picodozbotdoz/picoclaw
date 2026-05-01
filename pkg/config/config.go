@@ -574,6 +574,19 @@ type ModelConfig struct {
         // supports 384K output, but most agent turns only need 16K).
         MaxOutputTokens int `json:"max_output_tokens,omitempty" yaml:"max_output_tokens,omitempty"`
 
+        // StrictToolCalls enables DeepSeek V4's strict mode for tool calls (Beta).
+        // When true, all function definitions sent to the API will include strict: true,
+        // which validates that tool call outputs conform exactly to the JSON Schema.
+        // Requires using the beta endpoint (api_base pointing to api.deepseek.com/beta).
+        StrictToolCalls bool `json:"strict_tool_calls,omitempty" yaml:"strict_tool_calls,omitempty"`
+
+        // ResponseFormat forces the model output format. Supported values:
+        //   "text" (default) - freeform text output
+        //   "json_object" - guaranteed valid JSON output
+        // When "json_object" is set, the system or user message must include
+        // JSON formatting instructions (required by the API).
+        ResponseFormat string `json:"response_format,omitempty" yaml:"response_format,omitempty"`
+
         APIKeys SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty"` // API authentication keys (multiple keys for failover)
 
         // Enabled indicates whether this model entry is active. When omitted in

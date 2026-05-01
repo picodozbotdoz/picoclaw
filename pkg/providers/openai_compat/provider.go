@@ -144,7 +144,7 @@ func (p *Provider) buildRequestBody(
 
         requestBody := map[string]any{
                 "model":    model,
-                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages, model)),
+                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages, model, tools)),
         }
 
         // When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
@@ -216,6 +216,30 @@ func (p *Provider) buildRequestBody(
                 }
         }
 
+        // Chat Prefix Completion (Beta): Pre-seed assistant response with a prefix.
+        // When prefix_completion is set, append an assistant message with prefix: true.
+        if prefix, ok := options["prefix_completion"].(string); ok && prefix != "" {
+                messagesSlice, _ := requestBody["messages"].([]any)
+                messagesSlice = append(messagesSlice, map[string]any{
+                        "role":   "assistant",
+                        "content": prefix,
+                        "prefix": true,
+                })
+                requestBody["messages"] = messagesSlice
+        }
+
+        // JSON Output Mode: Force the model to produce valid JSON output.
+        if responseFmt, ok := options["response_format"].(string); ok && responseFmt != "" {
+                requestBody["response_format"] = map[string]any{"type": responseFmt}
+        }
+
+        // Strict Mode for Tool Calls (Beta): Add strict: true to function definitions.
+        strictMode, _ := options["strict_tool_calls"].(bool)
+        if strictMode && len(tools) > 0 {
+                strictTools := buildStrictToolsList(tools)
+                requestBody["tools"] = strictTools
+        }
+
         // Merge extra body fields configured per-provider/model.
         // These are injected last so they take precedence over defaults.
         maps.Copy(requestBody, p.extraBody)
@@ -242,7 +266,7 @@ func (p *Provider) SupportsThinking() bool {
         return p.isDeepSeekReasoningProvider()
 }
 
-func (p *Provider) prepareMessagesForRequest(messages []Message, model string) []Message {
+func (p *Provider) prepareMessagesForRequest(messages []Message, model string, tools []ToolDefinition) []Message {
         if len(messages) == 0 {
                 return nil
         }
@@ -252,6 +276,13 @@ func (p *Provider) prepareMessagesForRequest(messages []Message, model string) [
                 // reasoning_content to be preserved in multi-turn conversations per API docs.
                 // For V4 models, we only strip transient thought-only messages that
                 // have no content or tool calls.
+                //
+                // Interleaved Thinking (V4): The V4 paper distinguishes two behaviors:
+                // - Tool-calling scenarios: ALL reasoning preserved across ALL turns
+                // - General conversational: reasoning from earlier turns discarded
+                // In practice, preserving all reasoning_content is always safe and provides
+                // the best quality for agent workflows. The drop_thinking optimization is
+                // available via the "drop_thinking" option when token savings are needed.
                 if isDeepSeekV4ModelName(model) {
                         return filterDeepSeekV4ReasoningMessages(messages)
                 }
@@ -422,7 +453,47 @@ func (p *Provider) Chat(
                 return nil, common.HandleErrorResponse(resp, p.apiBase)
         }
 
-        return common.ReadAndParseResponse(resp, p.apiBase)
+        response, err := common.ReadAndParseResponse(resp, p.apiBase)
+        if err != nil {
+                return nil, err
+        }
+
+        // Check for DSML-formatted tool calls in the response content.
+        // This handles local inference engines (vLLM, Ollama) that return
+        // DSML instead of structured JSON tool_calls.
+        return maybeParseDSMLResponse(response), nil
+}
+
+// maybeParseDSMLResponse checks if the response content contains DSML-formatted
+// tool calls and parses them into the structured ToolCall format. This handles
+// the case where local inference engines (vLLM, Ollama) return DSML instead of
+// structured JSON tool_calls in the API response.
+func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
+        if response == nil || len(response.ToolCalls) > 0 {
+                return response // Already has structured tool calls from API
+        }
+
+        if !HasDSMLToolCalls(response.Content) && !HasDSMLToolCalls(response.ReasoningContent) {
+                return response // No DSML markers found
+        }
+
+        // Try parsing from content first
+        dsmlContent := response.Content
+        toolCalls, remaining, err := ParseDSMLToolCalls(dsmlContent)
+        if err != nil {
+                log.Printf("openai_compat: DSML parse warning: %v", err)
+        }
+
+        if len(toolCalls) > 0 {
+                response.ToolCalls = toolCalls
+                response.Content = remaining
+                if response.FinishReason == "stop" {
+                        response.FinishReason = "tool_calls"
+                }
+                log.Printf("openai_compat: parsed %d tool calls from DSML format", len(toolCalls))
+        }
+
+        return response
 }
 
 // ChatStream implements streaming via OpenAI-compatible SSE (stream: true).
@@ -658,6 +729,29 @@ func buildToolsList(tools []ToolDefinition, nativeSearch bool) []any {
         return result
 }
 
+// buildStrictToolsList creates a tools list with strict: true on each function
+// definition for DeepSeek V4 beta API. When strict mode is enabled, the API
+// validates that tool call outputs conform exactly to the JSON Schema.
+func buildStrictToolsList(tools []ToolDefinition) []any {
+        result := make([]any, 0, len(tools))
+        for _, t := range tools {
+                // Create a copy with strict: true added
+                fn := map[string]any{
+                        "name":        t.Function.Name,
+                        "strict":      true,
+                        "description": t.Function.Description,
+                }
+                if t.Function.Parameters != nil {
+                        fn["parameters"] = t.Function.Parameters
+                }
+                result = append(result, map[string]any{
+                        "type":     "function",
+                        "function": fn,
+                })
+        }
+        return result
+}
+
 func (p *Provider) SupportsNativeSearch() bool {
         return isNativeSearchHost(p.apiBase)
 }
@@ -689,6 +783,53 @@ func supportsPromptCacheKey(apiBase string) bool {
 // isDeepSeekV4ModelName reports whether the model identifier refers to a
 // DeepSeek V4 model. V4 models support 1M context, reasoning modes,
 // and automatic prefix caching.
+// hasToolInteractions reports whether any message in the history involves
+// tool interactions (tool role messages or assistant messages with tool calls).
+// This is used for DeepSeek V4 interleaved thinking: when tools have been
+// used in the conversation, all reasoning content must be preserved.
+func hasToolInteractions(messages []Message) bool {
+        for _, msg := range messages {
+                if msg.Role == "tool" || (msg.Role == "assistant" && len(msg.ToolCalls) > 0) {
+                        return true
+                }
+        }
+        return false
+}
+
+// filterDeepSeekV4ReasoningMessagesDropThinking implements the V4 "general
+// conversational" behavior: reasoning content from previous turns is discarded
+// when a new user message arrives. Only the most recent assistant turn retains
+// its reasoning_content. This is the drop_thinking=True behavior for V4 models
+// when no tools are present.
+func filterDeepSeekV4ReasoningMessagesDropThinking(messages []Message) []Message {
+        // Find the index of the last user message
+        lastUserIdx := -1
+        for i := len(messages) - 1; i >= 0; i-- {
+                if messages[i].Role == "user" {
+                        lastUserIdx = i
+                        break
+                }
+        }
+
+        out := make([]Message, 0, len(messages))
+        for i, msg := range messages {
+                if messageutil.IsTransientAssistantThoughtMessage(msg) {
+                        continue
+                }
+
+                cloned := msg
+                // Strip reasoning_content from assistant messages before the last user message
+                if cloned.Role == "assistant" && strings.TrimSpace(cloned.ReasoningContent) != "" && i < lastUserIdx {
+                        cloned.ReasoningContent = ""
+                }
+                if assistantMessageEmpty(cloned) {
+                        continue
+                }
+                out = append(out, cloned)
+        }
+        return out
+}
+
 func isDeepSeekV4ModelName(model string) bool {
         lower := strings.ToLower(model)
         return strings.Contains(lower, "deepseek-v4") ||
