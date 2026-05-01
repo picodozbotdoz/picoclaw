@@ -1,46 +1,46 @@
 package openai_compat
 
 import (
-	"bufio"
-	"bytes"
-	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"maps"
-	"net/http"
-	"net/url"
-	"strings"
-	"time"
+        "bufio"
+        "bytes"
+        "context"
+        "encoding/json"
+        "fmt"
+        "io"
+        "log"
+        "maps"
+        "net/http"
+        "net/url"
+        "strings"
+        "time"
 
-	"github.com/sipeed/picoclaw/pkg/providers/common"
-	"github.com/sipeed/picoclaw/pkg/providers/messageutil"
-	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
+        "github.com/sipeed/picoclaw/pkg/providers/common"
+        "github.com/sipeed/picoclaw/pkg/providers/messageutil"
+        "github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
 
 type (
-	ToolCall               = protocoltypes.ToolCall
-	FunctionCall           = protocoltypes.FunctionCall
-	LLMResponse            = protocoltypes.LLMResponse
-	UsageInfo              = protocoltypes.UsageInfo
-	Message                = protocoltypes.Message
-	ToolDefinition         = protocoltypes.ToolDefinition
-	ToolFunctionDefinition = protocoltypes.ToolFunctionDefinition
-	ExtraContent           = protocoltypes.ExtraContent
-	GoogleExtra            = protocoltypes.GoogleExtra
-	ReasoningDetail        = protocoltypes.ReasoningDetail
+        ToolCall               = protocoltypes.ToolCall
+        FunctionCall           = protocoltypes.FunctionCall
+        LLMResponse            = protocoltypes.LLMResponse
+        UsageInfo              = protocoltypes.UsageInfo
+        Message                = protocoltypes.Message
+        ToolDefinition         = protocoltypes.ToolDefinition
+        ToolFunctionDefinition = protocoltypes.ToolFunctionDefinition
+        ExtraContent           = protocoltypes.ExtraContent
+        GoogleExtra            = protocoltypes.GoogleExtra
+        ReasoningDetail        = protocoltypes.ReasoningDetail
 )
 
 type Provider struct {
-	apiKey         string
-	apiBase        string
-	providerName   string
-	maxTokensField string // Field name for max tokens (e.g., "max_completion_tokens" for o1/glm models)
-	httpClient     *http.Client
-	extraBody      map[string]any // Additional fields to inject into request body
-	customHeaders  map[string]string
-	userAgent      string
+        apiKey         string
+        apiBase        string
+        providerName   string
+        maxTokensField string // Field name for max tokens (e.g., "max_completion_tokens" for o1/glm models)
+        httpClient     *http.Client
+        extraBody      map[string]any // Additional fields to inject into request body
+        customHeaders  map[string]string
+        userAgent      string
 }
 
 type Option func(*Provider)
@@ -48,564 +48,656 @@ type Option func(*Provider)
 const defaultRequestTimeout = common.DefaultRequestTimeout
 
 var stripModelPrefixProviders = map[string]struct{}{
-	"litellm":    {},
-	"venice":     {},
-	"moonshot":   {},
-	"nvidia":     {},
-	"groq":       {},
-	"ollama":     {},
-	"deepseek":   {},
-	"google":     {},
-	"openrouter": {},
-	"zhipu":      {},
-	"mistral":    {},
-	"vivgrid":    {},
-	"minimax":    {},
-	"novita":     {},
-	"lmstudio":   {},
+        "litellm":    {},
+        "venice":     {},
+        "moonshot":   {},
+        "nvidia":     {},
+        "groq":       {},
+        "ollama":     {},
+        "deepseek":   {},
+        "google":     {},
+        "openrouter": {},
+        "zhipu":      {},
+        "mistral":    {},
+        "vivgrid":    {},
+        "minimax":    {},
+        "novita":     {},
+        "lmstudio":   {},
 }
 
 func WithMaxTokensField(maxTokensField string) Option {
-	return func(p *Provider) {
-		p.maxTokensField = maxTokensField
-	}
+        return func(p *Provider) {
+                p.maxTokensField = maxTokensField
+        }
 }
 
 func WithUserAgent(userAgent string) Option {
-	return func(p *Provider) {
-		p.userAgent = userAgent
-	}
+        return func(p *Provider) {
+                p.userAgent = userAgent
+        }
 }
 
 func WithRequestTimeout(timeout time.Duration) Option {
-	return func(p *Provider) {
-		if timeout > 0 {
-			p.httpClient.Timeout = timeout
-		}
-	}
+        return func(p *Provider) {
+                if timeout > 0 {
+                        p.httpClient.Timeout = timeout
+                }
+        }
 }
 
 func WithExtraBody(extraBody map[string]any) Option {
-	return func(p *Provider) {
-		p.extraBody = extraBody
-	}
+        return func(p *Provider) {
+                p.extraBody = extraBody
+        }
 }
 
 func WithCustomHeaders(customHeaders map[string]string) Option {
-	return func(p *Provider) {
-		p.customHeaders = customHeaders
-	}
+        return func(p *Provider) {
+                p.customHeaders = customHeaders
+        }
 }
 
 func WithProviderName(providerName string) Option {
-	return func(p *Provider) {
-		p.providerName = strings.ToLower(strings.TrimSpace(providerName))
-	}
+        return func(p *Provider) {
+                p.providerName = strings.ToLower(strings.TrimSpace(providerName))
+        }
 }
 
 func NewProvider(apiKey, apiBase, proxy string, opts ...Option) *Provider {
-	p := &Provider{
-		apiKey:     apiKey,
-		apiBase:    strings.TrimRight(apiBase, "/"),
-		httpClient: common.NewHTTPClient(proxy),
-	}
+        p := &Provider{
+                apiKey:     apiKey,
+                apiBase:    strings.TrimRight(apiBase, "/"),
+                httpClient: common.NewHTTPClient(proxy),
+        }
 
-	for _, opt := range opts {
-		if opt != nil {
-			opt(p)
-		}
-	}
+        for _, opt := range opts {
+                if opt != nil {
+                        opt(p)
+                }
+        }
 
-	return p
+        return p
 }
 
 func NewProviderWithMaxTokensField(apiKey, apiBase, proxy, maxTokensField string) *Provider {
-	return NewProvider(apiKey, apiBase, proxy, WithMaxTokensField(maxTokensField))
+        return NewProvider(apiKey, apiBase, proxy, WithMaxTokensField(maxTokensField))
 }
 
 func NewProviderWithMaxTokensFieldAndTimeout(
-	apiKey, apiBase, proxy, maxTokensField string,
-	requestTimeoutSeconds int,
+        apiKey, apiBase, proxy, maxTokensField string,
+        requestTimeoutSeconds int,
 ) *Provider {
-	return NewProvider(
-		apiKey,
-		apiBase,
-		proxy,
-		WithMaxTokensField(maxTokensField),
-		WithRequestTimeout(time.Duration(requestTimeoutSeconds)*time.Second),
-	)
+        return NewProvider(
+                apiKey,
+                apiBase,
+                proxy,
+                WithMaxTokensField(maxTokensField),
+                WithRequestTimeout(time.Duration(requestTimeoutSeconds)*time.Second),
+        )
 }
 
 // buildRequestBody constructs the common request body for Chat and ChatStream.
 func (p *Provider) buildRequestBody(
-	messages []Message, tools []ToolDefinition, model string, options map[string]any,
+        messages []Message, tools []ToolDefinition, model string, options map[string]any,
 ) map[string]any {
-	model = normalizeModel(model, p.apiBase)
+        model = normalizeModel(model, p.apiBase)
 
-	requestBody := map[string]any{
-		"model":    model,
-		"messages": common.SerializeMessages(p.prepareMessagesForRequest(messages)),
-	}
+        requestBody := map[string]any{
+                "model":    model,
+                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages)),
+        }
 
-	// When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
-	nativeSearch, _ := options["native_search"].(bool)
-	nativeSearch = nativeSearch && isNativeSearchHost(p.apiBase)
-	if len(tools) > 0 || nativeSearch {
-		requestBody["tools"] = buildToolsList(tools, nativeSearch)
-		requestBody["tool_choice"] = "auto"
-	}
+        // When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
+        nativeSearch, _ := options["native_search"].(bool)
+        nativeSearch = nativeSearch && isNativeSearchHost(p.apiBase)
+        if len(tools) > 0 || nativeSearch {
+                requestBody["tools"] = buildToolsList(tools, nativeSearch)
+                requestBody["tool_choice"] = "auto"
+        }
 
-	if maxTokens, ok := common.AsInt(options["max_tokens"]); ok {
-		fieldName := p.maxTokensField
-		if fieldName == "" {
-			lowerModel := strings.ToLower(model)
-			if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") ||
-				strings.Contains(lowerModel, "gpt-5") {
-				fieldName = "max_completion_tokens"
-			} else {
-				fieldName = "max_tokens"
-			}
-		}
-		requestBody[fieldName] = maxTokens
-	}
+        if maxTokens, ok := common.AsInt(options["max_tokens"]); ok {
+                fieldName := p.maxTokensField
+                if fieldName == "" {
+                        lowerModel := strings.ToLower(model)
+                        if strings.Contains(lowerModel, "glm") || strings.Contains(lowerModel, "o1") ||
+                                strings.Contains(lowerModel, "gpt-5") {
+                                fieldName = "max_completion_tokens"
+                        } else {
+                                fieldName = "max_tokens"
+                        }
+                }
+                requestBody[fieldName] = maxTokens
+        }
 
-	if temperature, ok := common.AsFloat(options["temperature"]); ok {
-		lowerModel := strings.ToLower(model)
-		if strings.Contains(lowerModel, "kimi") && strings.Contains(lowerModel, "k2") {
-			requestBody["temperature"] = 1.0
-		} else {
-			requestBody["temperature"] = temperature
-		}
-	}
+        if temperature, ok := common.AsFloat(options["temperature"]); ok {
+                lowerModel := strings.ToLower(model)
+                if strings.Contains(lowerModel, "kimi") && strings.Contains(lowerModel, "k2") {
+                        requestBody["temperature"] = 1.0
+                } else {
+                        requestBody["temperature"] = temperature
+                }
+        }
 
-	// Prompt caching: pass a stable cache key so OpenAI can bucket requests
-	// with the same key and reuse prefix KV cache across calls.
-	// Prompt caching is only supported by OpenAI-native endpoints.
-	// Non-OpenAI providers reject unknown fields with 422 errors.
-	if cacheKey, ok := options["prompt_cache_key"].(string); ok && cacheKey != "" {
-		if supportsPromptCacheKey(p.apiBase) {
-			requestBody["prompt_cache_key"] = cacheKey
-		}
-	}
+        // Prompt caching: pass a stable cache key so OpenAI can bucket requests
+        // with the same key and reuse prefix KV cache across calls.
+        // Prompt caching is only supported by OpenAI-native endpoints.
+        // Non-OpenAI providers reject unknown fields with 422 errors.
+        if cacheKey, ok := options["prompt_cache_key"].(string); ok && cacheKey != "" {
+                if supportsPromptCacheKey(p.apiBase) {
+                        requestBody["prompt_cache_key"] = cacheKey
+                }
+        }
 
-	// Merge extra body fields configured per-provider/model.
-	// These are injected last so they take precedence over defaults.
-	maps.Copy(requestBody, p.extraBody)
+        // DeepSeek V4 reasoning mode support.
+        // V4 models accept thinking.type + reasoning_effort parameters.
+        // Map PicoClaw's thinking_level to DeepSeek V4's API parameters:
+        //   off    → thinking.type: "disabled"
+        //   low/medium → thinking.type: "enabled", reasoning_effort: "high"
+        //   high/xhigh → thinking.type: "enabled", reasoning_effort: "max"
+        //   adaptive   → thinking.type: "enabled", reasoning_effort: "high" (V4 default)
+        if p.isDeepSeekReasoningProvider() && isDeepSeekV4ModelName(model) {
+                if level, ok := options["thinking_level"].(string); ok && level != "" {
+                        switch level {
+                        case "off":
+                                requestBody["thinking"] = map[string]any{"type": "disabled"}
+                        case "low", "medium", "adaptive":
+                                requestBody["thinking"] = map[string]any{"type": "enabled"}
+                                requestBody["reasoning_effort"] = "high"
+                        case "high", "xhigh":
+                                requestBody["thinking"] = map[string]any{"type": "enabled"}
+                                requestBody["reasoning_effort"] = "max"
+                        }
+                }
 
-	return requestBody
+                // user_id for KV cache isolation in multi-tenant scenarios.
+                // DeepSeek's prefix caching is isolated per user_id.
+                if uid, ok := options["user_id"].(string); ok && uid != "" {
+                        requestBody["user"] = uid
+                }
+        }
+
+        // Merge extra body fields configured per-provider/model.
+        // These are injected last so they take precedence over defaults.
+        maps.Copy(requestBody, p.extraBody)
+
+        return requestBody
 }
 
 func (p *Provider) applyCustomHeaders(req *http.Request) {
-	for k, v := range p.customHeaders {
-		if strings.TrimSpace(k) == "" {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
+        for k, v := range p.customHeaders {
+                if strings.TrimSpace(k) == "" {
+                        continue
+                }
+                req.Header.Set(k, v)
+        }
 }
 
 func (p *Provider) SetProviderName(providerName string) {
-	p.providerName = strings.ToLower(strings.TrimSpace(providerName))
+        p.providerName = strings.ToLower(strings.TrimSpace(providerName))
 }
 
 func (p *Provider) prepareMessagesForRequest(messages []Message) []Message {
-	if len(messages) == 0 {
-		return nil
-	}
+        if len(messages) == 0 {
+                return nil
+        }
 
-	if p.isDeepSeekReasoningProvider() {
-		return filterDeepSeekReasoningMessages(messages)
-	}
-	return stripReasoningMessages(messages)
+        if p.isDeepSeekReasoningProvider() {
+                // DeepSeek V4 models (deepseek-v4-flash, deepseek-v4-pro) require
+                // reasoning_content to be preserved in multi-turn conversations per API docs.
+                // For V4 models, we only strip reasoning from non-tool turns without a
+                // tool interaction, as the model needs its prior reasoning context.
+                if p.isDeepSeekV4Model(messages) {
+                        return filterDeepSeekV4ReasoningMessages(messages)
+                }
+                return filterDeepSeekReasoningMessages(messages)
+        }
+        return stripReasoningMessages(messages)
 }
 
 func (p *Provider) isDeepSeekReasoningProvider() bool {
-	return p.providerName == "deepseek" || isDeepSeekHost(p.apiBase)
+        return p.providerName == "deepseek" || isDeepSeekHost(p.apiBase)
+}
+
+// isDeepSeekV4Model reports whether any assistant message in the conversation
+// comes from a DeepSeek V4 model (deepseek-v4-flash or deepseek-v4-pro).
+// V4 models require reasoning_content to be preserved in multi-turn.
+func (p *Provider) isDeepSeekV4Model(messages []Message) bool {
+        // If the provider is DeepSeek and the model name contains v4, treat as V4.
+        // We also check if any message has ReasoningContent, which is a strong
+        // signal that the model produced extended thinking output.
+        for _, msg := range messages {
+                if msg.Role == "assistant" && strings.TrimSpace(msg.ReasoningContent) != "" {
+                        return true
+                }
+        }
+        return false
 }
 
 func isDeepSeekHost(apiBase string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(apiBase))
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	return host == "deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
+        parsed, err := url.Parse(strings.TrimSpace(apiBase))
+        if err != nil {
+                return false
+        }
+        host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+        return host == "deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
 }
 
 func filterDeepSeekReasoningMessages(messages []Message) []Message {
-	out := make([]Message, 0, len(messages))
-	start := 0
+        out := make([]Message, 0, len(messages))
+        start := 0
 
-	flush := func(end int) {
-		if end <= start {
-			return
-		}
-		out = append(out, filterDeepSeekReasoningTurn(messages[start:end])...)
-		start = end
-	}
+        flush := func(end int) {
+                if end <= start {
+                        return
+                }
+                out = append(out, filterDeepSeekReasoningTurn(messages[start:end])...)
+                start = end
+        }
 
-	for i := 1; i < len(messages); i++ {
-		if messages[i].Role == "user" {
-			flush(i)
-		}
-	}
-	flush(len(messages))
+        for i := 1; i < len(messages); i++ {
+                if messages[i].Role == "user" {
+                        flush(i)
+                }
+        }
+        flush(len(messages))
 
-	return out
+        return out
+}
+
+// filterDeepSeekV4ReasoningMessages preserves reasoning_content in all turns
+// for DeepSeek V4 models. The V4 API docs state: "When concatenating subsequent
+// multi-round messages, include the reasoning_content field to maintain the
+// context of the model's reasoning." We still filter transient thought-only
+// messages that have no content or tool calls.
+func filterDeepSeekV4ReasoningMessages(messages []Message) []Message {
+        out := make([]Message, 0, len(messages))
+        for _, msg := range messages {
+                if messageutil.IsTransientAssistantThoughtMessage(msg) {
+                        continue
+                }
+                cloned := msg
+                // V4: keep reasoning_content in all assistant messages, even non-tool turns.
+                // This is required for the model to maintain its reasoning context.
+                if assistantMessageEmpty(cloned) {
+                        continue
+                }
+                out = append(out, cloned)
+        }
+        return out
 }
 
 func filterDeepSeekReasoningTurn(messages []Message) []Message {
-	hasToolInteraction := false
-	for _, msg := range messages {
-		if msg.Role == "tool" || (msg.Role == "assistant" && len(msg.ToolCalls) > 0) {
-			hasToolInteraction = true
-			break
-		}
-	}
+        hasToolInteraction := false
+        for _, msg := range messages {
+                if msg.Role == "tool" || (msg.Role == "assistant" && len(msg.ToolCalls) > 0) {
+                        hasToolInteraction = true
+                        break
+                }
+        }
 
-	out := make([]Message, 0, len(messages))
-	for _, msg := range messages {
-		if messageutil.IsTransientAssistantThoughtMessage(msg) {
-			continue
-		}
+        out := make([]Message, 0, len(messages))
+        for _, msg := range messages {
+                if messageutil.IsTransientAssistantThoughtMessage(msg) {
+                        continue
+                }
 
-		cloned := msg
-		// DeepSeek thinking-mode replay only requires reasoning_content for
-		// turns that participate in a tool interaction round. For plain
-		// assistant turns between two user messages, the docs say the API will
-		// ignore reasoning_content on replay, so we strip it here.
-		if cloned.Role == "assistant" && strings.TrimSpace(cloned.ReasoningContent) != "" && !hasToolInteraction {
-			cloned.ReasoningContent = ""
-		}
-		if assistantMessageEmpty(cloned) {
-			continue
-		}
-		out = append(out, cloned)
-	}
+                cloned := msg
+                // DeepSeek thinking-mode replay only requires reasoning_content for
+                // turns that participate in a tool interaction round. For plain
+                // assistant turns between two user messages, the docs say the API will
+                // ignore reasoning_content on replay, so we strip it here.
+                if cloned.Role == "assistant" && strings.TrimSpace(cloned.ReasoningContent) != "" && !hasToolInteraction {
+                        cloned.ReasoningContent = ""
+                }
+                if assistantMessageEmpty(cloned) {
+                        continue
+                }
+                out = append(out, cloned)
+        }
 
-	return out
+        return out
 }
 
 func stripReasoningMessages(messages []Message) []Message {
-	out := make([]Message, 0, len(messages))
-	for _, msg := range messages {
-		if messageutil.IsTransientAssistantThoughtMessage(msg) {
-			continue
-		}
+        out := make([]Message, 0, len(messages))
+        for _, msg := range messages {
+                if messageutil.IsTransientAssistantThoughtMessage(msg) {
+                        continue
+                }
 
-		cloned := msg
-		cloned.ReasoningContent = ""
-		if assistantMessageEmpty(cloned) {
-			continue
-		}
-		out = append(out, cloned)
-	}
-	return out
+                cloned := msg
+                cloned.ReasoningContent = ""
+                if assistantMessageEmpty(cloned) {
+                        continue
+                }
+                out = append(out, cloned)
+        }
+        return out
 }
 
 func assistantMessageEmpty(msg Message) bool {
-	return msg.Role == "assistant" &&
-		strings.TrimSpace(msg.Content) == "" &&
-		strings.TrimSpace(msg.ReasoningContent) == "" &&
-		len(msg.ToolCalls) == 0 &&
-		len(msg.Media) == 0 &&
-		len(msg.Attachments) == 0 &&
-		strings.TrimSpace(msg.ToolCallID) == ""
+        return msg.Role == "assistant" &&
+                strings.TrimSpace(msg.Content) == "" &&
+                strings.TrimSpace(msg.ReasoningContent) == "" &&
+                len(msg.ToolCalls) == 0 &&
+                len(msg.Media) == 0 &&
+                len(msg.Attachments) == 0 &&
+                strings.TrimSpace(msg.ToolCallID) == ""
 }
 
 func (p *Provider) Chat(
-	ctx context.Context,
-	messages []Message,
-	tools []ToolDefinition,
-	model string,
-	options map[string]any,
+        ctx context.Context,
+        messages []Message,
+        tools []ToolDefinition,
+        model string,
+        options map[string]any,
 ) (*LLMResponse, error) {
-	if p.apiBase == "" {
-		return nil, fmt.Errorf("API base not configured")
-	}
+        if p.apiBase == "" {
+                return nil, fmt.Errorf("API base not configured")
+        }
 
-	requestBody := p.buildRequestBody(messages, tools, model, options)
+        requestBody := p.buildRequestBody(messages, tools, model, options)
 
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
+        jsonData, err := json.Marshal(requestBody)
+        if err != nil {
+                return nil, fmt.Errorf("failed to marshal request: %w", err)
+        }
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
+        req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+        if err != nil {
+                return nil, fmt.Errorf("failed to create request: %w", err)
+        }
 
-	req.Header.Set("Content-Type", "application/json")
-	if p.userAgent != "" {
-		req.Header.Set("User-Agent", p.userAgent)
-	}
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	p.applyCustomHeaders(req)
+        req.Header.Set("Content-Type", "application/json")
+        if p.userAgent != "" {
+                req.Header.Set("User-Agent", p.userAgent)
+        }
+        if p.apiKey != "" {
+                req.Header.Set("Authorization", "Bearer "+p.apiKey)
+        }
+        p.applyCustomHeaders(req)
 
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
+        resp, err := p.httpClient.Do(req)
+        if err != nil {
+                return nil, fmt.Errorf("failed to send request: %w", err)
+        }
+        defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, common.HandleErrorResponse(resp, p.apiBase)
-	}
+        if resp.StatusCode != http.StatusOK {
+                return nil, common.HandleErrorResponse(resp, p.apiBase)
+        }
 
-	return common.ReadAndParseResponse(resp, p.apiBase)
+        return common.ReadAndParseResponse(resp, p.apiBase)
 }
 
 // ChatStream implements streaming via OpenAI-compatible SSE (stream: true).
 // onChunk receives the accumulated text so far on each text delta.
 func (p *Provider) ChatStream(
-	ctx context.Context,
-	messages []Message,
-	tools []ToolDefinition,
-	model string,
-	options map[string]any,
-	onChunk func(accumulated string),
+        ctx context.Context,
+        messages []Message,
+        tools []ToolDefinition,
+        model string,
+        options map[string]any,
+        onChunk func(accumulated string),
 ) (*LLMResponse, error) {
-	if p.apiBase == "" {
-		return nil, fmt.Errorf("API base not configured")
-	}
+        if p.apiBase == "" {
+                return nil, fmt.Errorf("API base not configured")
+        }
 
-	requestBody := p.buildRequestBody(messages, tools, model, options)
-	requestBody["stream"] = true
+        requestBody := p.buildRequestBody(messages, tools, model, options)
+        requestBody["stream"] = true
 
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
+        jsonData, err := json.Marshal(requestBody)
+        if err != nil {
+                return nil, fmt.Errorf("failed to marshal request: %w", err)
+        }
 
-	req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
+        req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+        if err != nil {
+                return nil, fmt.Errorf("failed to create request: %w", err)
+        }
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	if p.userAgent != "" {
-		req.Header.Set("User-Agent", p.userAgent)
-	}
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	p.applyCustomHeaders(req)
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("Accept", "text/event-stream")
+        if p.userAgent != "" {
+                req.Header.Set("User-Agent", p.userAgent)
+        }
+        if p.apiKey != "" {
+                req.Header.Set("Authorization", "Bearer "+p.apiKey)
+        }
+        p.applyCustomHeaders(req)
 
-	// Use a client without Timeout for streaming — the http.Client.Timeout covers
-	// the entire request lifecycle including body reads, which would kill long streams.
-	// Context cancellation still provides the safety net.
-	streamClient := &http.Client{Transport: p.httpClient.Transport}
-	resp, err := streamClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
+        // Use a client without Timeout for streaming — the http.Client.Timeout covers
+        // the entire request lifecycle including body reads, which would kill long streams.
+        // Context cancellation still provides the safety net.
+        streamClient := &http.Client{Transport: p.httpClient.Transport}
+        resp, err := streamClient.Do(req)
+        if err != nil {
+                return nil, fmt.Errorf("failed to send request: %w", err)
+        }
+        defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, common.HandleErrorResponse(resp, p.apiBase)
-	}
+        if resp.StatusCode != http.StatusOK {
+                return nil, common.HandleErrorResponse(resp, p.apiBase)
+        }
 
-	return parseStreamResponse(ctx, resp.Body, onChunk)
+        return parseStreamResponse(ctx, resp.Body, onChunk)
 }
 
 // parseStreamResponse parses an OpenAI-compatible SSE stream.
 func parseStreamResponse(
-	ctx context.Context,
-	reader io.Reader,
-	onChunk func(accumulated string),
+        ctx context.Context,
+        reader io.Reader,
+        onChunk func(accumulated string),
 ) (*LLMResponse, error) {
-	var textContent strings.Builder
-	var finishReason string
-	var usage *UsageInfo
+        var textContent strings.Builder
+        var reasoningContent strings.Builder
+        var finishReason string
+        var usage *UsageInfo
 
-	// Tool call assembly: OpenAI streams tool calls as incremental deltas
-	type toolAccum struct {
-		id       string
-		name     string
-		argsJSON strings.Builder
-	}
-	activeTools := map[int]*toolAccum{}
+        // Tool call assembly: OpenAI streams tool calls as incremental deltas
+        type toolAccum struct {
+                id       string
+                name     string
+                argsJSON strings.Builder
+        }
+        activeTools := map[int]*toolAccum{}
 
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 1MB initial, 10MB max
-	for scanner.Scan() {
-		// Check for context cancellation between chunks
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
+        scanner := bufio.NewScanner(reader)
+        scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024) // 1MB initial, 10MB max
+        for scanner.Scan() {
+                // Check for context cancellation between chunks
+                if err := ctx.Err(); err != nil {
+                        return nil, err
+                }
 
-		line := scanner.Text()
+                line := scanner.Text()
 
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
+                if !strings.HasPrefix(line, "data: ") {
+                        continue
+                }
+                data := strings.TrimPrefix(line, "data: ")
+                if data == "[DONE]" {
+                        break
+                }
 
-		var chunk struct {
-			Choices []struct {
-				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
-						Index    int    `json:"index"`
-						ID       string `json:"id"`
-						Function *struct {
-							Name      string `json:"name"`
-							Arguments string `json:"arguments"`
-						} `json:"function"`
-					} `json:"tool_calls"`
-				} `json:"delta"`
-				FinishReason *string `json:"finish_reason"`
-			} `json:"choices"`
-			Usage *UsageInfo `json:"usage"`
-		}
+                var chunk struct {
+                        Choices []struct {
+                                Delta struct {
+                                        Content          string `json:"content"`
+                                        ReasoningContent string `json:"reasoning_content"`
+                                        ToolCalls []struct {
+                                                Index    int    `json:"index"`
+                                                ID       string `json:"id"`
+                                                Function *struct {
+                                                        Name      string `json:"name"`
+                                                        Arguments string `json:"arguments"`
+                                                } `json:"function"`
+                                        } `json:"tool_calls"`
+                                } `json:"delta"`
+                                FinishReason *string `json:"finish_reason"`
+                        } `json:"choices"`
+                        Usage *UsageInfo `json:"usage"`
+                }
 
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			continue // skip malformed chunks
-		}
+                if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+                        continue // skip malformed chunks
+                }
 
-		if chunk.Usage != nil {
-			usage = chunk.Usage
-		}
+                if chunk.Usage != nil {
+                        usage = chunk.Usage
+                }
 
-		if len(chunk.Choices) == 0 {
-			continue
-		}
+                if len(chunk.Choices) == 0 {
+                        continue
+                }
 
-		choice := chunk.Choices[0]
+                choice := chunk.Choices[0]
 
-		// Accumulate text content
-		if choice.Delta.Content != "" {
-			textContent.WriteString(choice.Delta.Content)
-			if onChunk != nil {
-				onChunk(textContent.String())
-			}
-		}
+                // Accumulate text content
+                if choice.Delta.Content != "" {
+                        textContent.WriteString(choice.Delta.Content)
+                        if onChunk != nil {
+                                onChunk(textContent.String())
+                        }
+                }
 
-		// Accumulate tool call deltas
-		for _, tc := range choice.Delta.ToolCalls {
-			acc, ok := activeTools[tc.Index]
-			if !ok {
-				acc = &toolAccum{}
-				activeTools[tc.Index] = acc
-			}
-			if tc.ID != "" {
-				acc.id = tc.ID
-			}
-			if tc.Function != nil {
-				if tc.Function.Name != "" {
-					acc.name = tc.Function.Name
-				}
-				if tc.Function.Arguments != "" {
-					acc.argsJSON.WriteString(tc.Function.Arguments)
-				}
-			}
-		}
+                // Accumulate reasoning content (DeepSeek V4 thinking mode)
+                if choice.Delta.ReasoningContent != "" {
+                        reasoningContent.WriteString(choice.Delta.ReasoningContent)
+                }
 
-		if choice.FinishReason != nil {
-			finishReason = *choice.FinishReason
-		}
-	}
+                // Accumulate tool call deltas
+                for _, tc := range choice.Delta.ToolCalls {
+                        acc, ok := activeTools[tc.Index]
+                        if !ok {
+                                acc = &toolAccum{}
+                                activeTools[tc.Index] = acc
+                        }
+                        if tc.ID != "" {
+                                acc.id = tc.ID
+                        }
+                        if tc.Function != nil {
+                                if tc.Function.Name != "" {
+                                        acc.name = tc.Function.Name
+                                }
+                                if tc.Function.Arguments != "" {
+                                        acc.argsJSON.WriteString(tc.Function.Arguments)
+                                }
+                        }
+                }
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("streaming read error: %w", err)
-	}
+                if choice.FinishReason != nil {
+                        finishReason = *choice.FinishReason
+                }
+        }
 
-	// Assemble tool calls from accumulated deltas
-	var toolCalls []ToolCall
-	for i := 0; i < len(activeTools); i++ {
-		acc, ok := activeTools[i]
-		if !ok {
-			continue
-		}
-		args := make(map[string]any)
-		raw := acc.argsJSON.String()
-		if raw != "" {
-			if err := json.Unmarshal([]byte(raw), &args); err != nil {
-				log.Printf("openai_compat stream: failed to decode tool call arguments for %q: %v", acc.name, err)
-				args["raw"] = raw
-			}
-		}
-		toolCalls = append(toolCalls, ToolCall{
-			ID:        acc.id,
-			Name:      acc.name,
-			Arguments: args,
-		})
-	}
+        if err := scanner.Err(); err != nil {
+                return nil, fmt.Errorf("streaming read error: %w", err)
+        }
 
-	if finishReason == "" {
-		finishReason = "stop"
-	}
+        // Assemble tool calls from accumulated deltas
+        var toolCalls []ToolCall
+        for i := 0; i < len(activeTools); i++ {
+                acc, ok := activeTools[i]
+                if !ok {
+                        continue
+                }
+                args := make(map[string]any)
+                raw := acc.argsJSON.String()
+                if raw != "" {
+                        if err := json.Unmarshal([]byte(raw), &args); err != nil {
+                                log.Printf("openai_compat stream: failed to decode tool call arguments for %q: %v", acc.name, err)
+                                args["raw"] = raw
+                        }
+                }
+                toolCalls = append(toolCalls, ToolCall{
+                        ID:        acc.id,
+                        Name:      acc.name,
+                        Arguments: args,
+                })
+        }
 
-	return &LLMResponse{
-		Content:      textContent.String(),
-		ToolCalls:    toolCalls,
-		FinishReason: finishReason,
-		Usage:        usage,
-	}, nil
+        if finishReason == "" {
+                finishReason = "stop"
+        }
+
+        return &LLMResponse{
+                Content:          textContent.String(),
+                ReasoningContent: reasoningContent.String(),
+                ToolCalls:        toolCalls,
+                FinishReason:     finishReason,
+                Usage:            usage,
+        }, nil
 }
 
 func normalizeModel(model, apiBase string) string {
-	before, after, ok := strings.Cut(model, "/")
-	if !ok {
-		return model
-	}
+        before, after, ok := strings.Cut(model, "/")
+        if !ok {
+                return model
+        }
 
-	if strings.Contains(strings.ToLower(apiBase), "openrouter.ai") {
-		return model
-	}
+        if strings.Contains(strings.ToLower(apiBase), "openrouter.ai") {
+                return model
+        }
 
-	prefix := strings.ToLower(before)
-	if _, ok := stripModelPrefixProviders[prefix]; ok {
-		return after
-	}
+        prefix := strings.ToLower(before)
+        if _, ok := stripModelPrefixProviders[prefix]; ok {
+                return after
+        }
 
-	return model
+        return model
 }
 
 func buildToolsList(tools []ToolDefinition, nativeSearch bool) []any {
-	result := make([]any, 0, len(tools)+1)
-	for _, t := range tools {
-		if nativeSearch && strings.EqualFold(t.Function.Name, "web_search") {
-			continue
-		}
-		result = append(result, t)
-	}
-	if nativeSearch {
-		result = append(result, map[string]any{"type": "web_search_preview"})
-	}
-	return result
+        result := make([]any, 0, len(tools)+1)
+        for _, t := range tools {
+                if nativeSearch && strings.EqualFold(t.Function.Name, "web_search") {
+                        continue
+                }
+                result = append(result, t)
+        }
+        if nativeSearch {
+                result = append(result, map[string]any{"type": "web_search_preview"})
+        }
+        return result
 }
 
 func (p *Provider) SupportsNativeSearch() bool {
-	return isNativeSearchHost(p.apiBase)
+        return isNativeSearchHost(p.apiBase)
 }
 
 // isNativeOpenAIOrAzureEndpoint reports whether the given API base points to
 // OpenAI's own API or an Azure OpenAI deployment.
 func isNativeOpenAIOrAzureEndpoint(apiBase string) bool {
-	u, err := url.Parse(apiBase)
-	if err != nil {
-		return false
-	}
-	host := u.Hostname()
-	return host == "api.openai.com" || strings.HasSuffix(host, ".openai.azure.com")
+        u, err := url.Parse(apiBase)
+        if err != nil {
+                return false
+        }
+        host := u.Hostname()
+        return host == "api.openai.com" || strings.HasSuffix(host, ".openai.azure.com")
 }
 
 func isNativeSearchHost(apiBase string) bool {
-	return isNativeOpenAIOrAzureEndpoint(apiBase)
+        return isNativeOpenAIOrAzureEndpoint(apiBase)
 }
 
 // supportsPromptCacheKey reports whether the given API base is known to
 // support the prompt_cache_key request field. Currently only OpenAI's own
 // API and Azure OpenAI support this. All other OpenAI-compatible providers
 // (Mistral, Gemini, DeepSeek, Groq, etc.) reject unknown fields with 422 errors.
+// DeepSeek V4 uses automatic prefix caching (no explicit cache key needed).
 func supportsPromptCacheKey(apiBase string) bool {
-	return isNativeOpenAIOrAzureEndpoint(apiBase)
+        return isNativeOpenAIOrAzureEndpoint(apiBase)
+}
+
+// isDeepSeekV4ModelName reports whether the model identifier refers to a
+// DeepSeek V4 model. V4 models support 1M context, reasoning modes,
+// and automatic prefix caching.
+func isDeepSeekV4ModelName(model string) bool {
+        lower := strings.ToLower(model)
+        return strings.Contains(lower, "deepseek-v4") ||
+                strings.Contains(lower, "deepseek_v4") ||
+                strings.HasPrefix(lower, "v4-flash") ||
+                strings.HasPrefix(lower, "v4-pro")
 }
