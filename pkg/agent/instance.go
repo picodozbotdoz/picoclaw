@@ -29,6 +29,7 @@ type AgentInstance struct {
         Workspace                 string
         MaxIterations             int
         MaxTokens                 int
+        MaxOutputTokens           int
         Temperature               float64
         ThinkingLevel             ThinkingLevel
         ContextWindow             int
@@ -151,6 +152,26 @@ func NewAgentInstance(
                 maxTokens = 8192
         }
 
+        // MaxOutputTokens caps max_tokens to prevent accidental expensive requests.
+        // For example, DeepSeek V4 supports up to 384K output tokens at $0.28/M,
+        // but the default should be conservative (16K).
+        var maxOutputTokens int
+        if mc, err := cfg.GetModelConfig(model); err == nil && mc.MaxOutputTokens > 0 {
+                maxOutputTokens = mc.MaxOutputTokens
+        }
+        // Fallback to runtime model defaults if ModelConfig didn't specify MaxOutputTokens.
+        if maxOutputTokens == 0 {
+                if md := config.LookupModelDefaults(model); md != nil && md.MaxOutputTokens > 0 {
+                        maxOutputTokens = md.MaxOutputTokens
+                }
+        }
+        // Enforce the cap: if MaxTokens exceeds MaxOutputTokens, reduce it.
+        if maxOutputTokens > 0 && maxTokens > maxOutputTokens {
+                logger.InfoCF("agent", "MaxTokens exceeds MaxOutputTokens, capping to model limit",
+                        map[string]any{"model": model, "max_tokens": maxTokens, "max_output_tokens": maxOutputTokens, "agent_id": agentID})
+                maxTokens = maxOutputTokens
+        }
+
         contextWindow := defaults.ContextWindow
         if contextWindow == 0 {
                 // Check if the resolved model config specifies a model-level context window.
@@ -158,6 +179,12 @@ func NewAgentInstance(
                 // windows (e.g., DeepSeek V4 = 1M tokens).
                 if mc, err := cfg.GetModelConfig(model); err == nil && mc.ContextWindow > 0 {
                         contextWindow = mc.ContextWindow
+                }
+        }
+        if contextWindow == 0 {
+                // Fallback to runtime model defaults (e.g., 1M for DeepSeek V4).
+                if md := config.LookupModelDefaults(model); md != nil && md.ContextWindow > 0 {
+                        contextWindow = md.ContextWindow
                 }
         }
         if contextWindow == 0 {
@@ -253,6 +280,7 @@ func NewAgentInstance(
                 Workspace:                 workspace,
                 MaxIterations:             maxIter,
                 MaxTokens:                 maxTokens,
+                MaxOutputTokens:           maxOutputTokens,
                 Temperature:               temperature,
                 ThinkingLevel:             thinkingLevel,
                 ContextWindow:             contextWindow,

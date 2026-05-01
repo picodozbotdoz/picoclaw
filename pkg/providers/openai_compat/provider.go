@@ -236,6 +236,12 @@ func (p *Provider) SetProviderName(providerName string) {
         p.providerName = strings.ToLower(strings.TrimSpace(providerName))
 }
 
+// SupportsThinking implements providers.ThinkingCapable.
+// DeepSeek V4 and other reasoning-capable providers support extended thinking.
+func (p *Provider) SupportsThinking() bool {
+        return p.isDeepSeekReasoningProvider()
+}
+
 func (p *Provider) prepareMessagesForRequest(messages []Message, model string) []Message {
         if len(messages) == 0 {
                 return nil

@@ -8,6 +8,7 @@ package config
 import (
         "encoding/json"
         "path/filepath"
+        "strings"
 
         "github.com/sipeed/picoclaw/pkg"
 )
@@ -596,4 +597,35 @@ func defaultChannels() ChannelsConfig {
                 channels[name] = bc
         }
         return channels
+}
+
+// ModelDefaults contains recommended configuration values for a specific model.
+type ModelDefaults struct {
+        ContextWindow  int
+        MaxOutputTokens int
+        ThinkingLevel  string
+}
+
+// knownModelDefaults maps model name prefixes to recommended defaults.
+// This provides runtime lookup for models that may not have a static entry
+// in the ModelList (e.g., user-added custom models).
+var knownModelDefaults = []struct {
+        Prefix  string
+        Defaults ModelDefaults
+}{
+        {Prefix: "deepseek-v4-flash", Defaults: ModelDefaults{ContextWindow: 1048576, MaxOutputTokens: 384000, ThinkingLevel: "medium"}},
+        {Prefix: "deepseek-v4-pro", Defaults: ModelDefaults{ContextWindow: 1048576, MaxOutputTokens: 384000, ThinkingLevel: "high"}},
+        {Prefix: "deepseek-v4", Defaults: ModelDefaults{ContextWindow: 1048576, MaxOutputTokens: 384000, ThinkingLevel: "medium"}},
+}
+
+// LookupModelDefaults returns recommended configuration defaults for a model
+// based on its name. Returns nil if no known defaults exist for the model.
+func LookupModelDefaults(modelName string) *ModelDefaults {
+        lower := strings.ToLower(modelName)
+        for _, entry := range knownModelDefaults {
+                if strings.Contains(lower, entry.Prefix) {
+                        return &entry.Defaults
+                }
+        }
+        return nil
 }
