@@ -37,6 +37,8 @@ type AgentInstance struct {
         SummarizeTokenPercent     int
         StrictToolCalls           bool
         ResponseFormat            string
+        CompressionStrategy       string // "eager", "adaptive", "conservative"
+        FullContextMode           bool   // disables summarization, only emergency compression
         Provider                  providers.LLMProvider
         Sessions                  session.SessionStore
         ContextBuilder            *ContextBuilder
@@ -243,6 +245,12 @@ func NewAgentInstance(
                 summarizeTokenPercent = 75
         }
 
+        compressionStrategy := defaults.CompressionStrategy
+        if compressionStrategy == "" {
+                compressionStrategy = "eager"
+        }
+        fullContextMode := defaults.FullContextMode
+
         // Resolve fallback candidates
         candidates := resolveModelCandidates(cfg, defaults.Provider, model, fallbacks)
 
@@ -298,6 +306,8 @@ func NewAgentInstance(
                 SummarizeTokenPercent:     summarizeTokenPercent,
                 StrictToolCalls:           strictToolCalls,
                 ResponseFormat:            responseFormat,
+                CompressionStrategy:       compressionStrategy,
+                FullContextMode:           fullContextMode,
                 Provider:                  provider,
                 Sessions:                  sessions,
                 ContextBuilder:            contextBuilder,

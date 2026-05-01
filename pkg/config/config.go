@@ -276,6 +276,12 @@ type AgentDefaults struct {
         SplitOnMarker             bool               `json:"split_on_marker"                  env:"PICOCLAW_AGENTS_DEFAULTS_SPLIT_ON_MARKER"` // split messages on <|[SPLIT]|> marker
         ContextManager            string             `json:"context_manager,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER"`
         ContextManagerConfig      json.RawMessage    `json:"context_manager_config,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER_CONFIG"`
+        // CompressionStrategy controls how conversation history compression works.
+        // Supported values: "eager" (default, current behavior), "adaptive" (scale with context), "conservative" (only on budget overflow)
+        CompressionStrategy string `json:"compression_strategy,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_COMPRESSION_STRATEGY"`
+        // FullContextMode disables summarization entirely for models with very large context
+        // windows (e.g., DeepSeek V4 1M). Only emergency compression on context overflow is allowed.
+        FullContextMode bool `json:"full_context_mode,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_FULL_CONTEXT_MODE"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
