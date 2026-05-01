@@ -1131,6 +1131,107 @@ func TestPreSend_ToolFeedbackSeparateMessagesDeletesPlaceholderAndSkipsEdit(t *t
 	}
 }
 
+func TestPreSend_ThoughtPlaceholderDeleteAndSkipsEdit(t *testing.T) {
+	m := newTestManager()
+
+	ch := &mockDeletingMessageEditor{
+		mockMessageEditor: mockMessageEditor{
+			editFn: func(_ context.Context, _, _, _ string) error {
+				t.Fatal("expected thought message to bypass placeholder edit")
+				return nil
+			},
+		},
+	}
+
+	m.RecordPlaceholder("test", "123", "456")
+
+	msg := testOutboundMessage(bus.OutboundMessage{
+		Channel: "test",
+		ChatID:  "123",
+		Content: "thinking trace",
+		Context: bus.InboundContext{
+			Channel: "test",
+			ChatID:  "123",
+			Raw: map[string]string{
+				"message_kind": "thought",
+			},
+		},
+	})
+
+	msgIDs, handled := m.preSend(context.Background(), "test", msg, ch)
+	if handled {
+		t.Fatalf(
+			"expected thought message to fall through so the channel can send a structured message, got %v",
+			msgIDs,
+		)
+	}
+	if ch.deleteCalls != 1 {
+		t.Fatalf("expected placeholder deletion, got %d delete calls", ch.deleteCalls)
+	}
+	if ch.deletedChatID != "123" || ch.deletedMessageID != "456" {
+		t.Fatalf("unexpected placeholder deletion target: %s/%s", ch.deletedChatID, ch.deletedMessageID)
+	}
+	if _, ok := m.placeholders.Load("test:123"); ok {
+		t.Fatal("expected placeholder to be consumed before structured thought send")
+	}
+}
+
+func TestSendWithRetry_ToolCallsPlaceholderDeleteAndFallsThroughToSend(t *testing.T) {
+	m := newTestManager()
+
+	ch := &mockDeletingMessageEditor{
+		mockMessageEditor: mockMessageEditor{
+			mockChannel: mockChannel{
+				sendFn: func(_ context.Context, msg bus.OutboundMessage) error {
+					if got := msg.Context.Raw["message_kind"]; got != "tool_calls" {
+						t.Fatalf("expected tool_calls message kind, got %q", got)
+					}
+					if msg.Content != "" {
+						t.Fatalf("expected empty tool_calls content, got %q", msg.Content)
+					}
+					return nil
+				},
+			},
+			editFn: func(_ context.Context, _, _, _ string) error {
+				t.Fatal("expected tool_calls message to bypass placeholder edit")
+				return nil
+			},
+		},
+	}
+
+	m.RecordPlaceholder("test", "123", "456")
+
+	w := &channelWorker{
+		ch:      ch,
+		limiter: rate.NewLimiter(rate.Inf, 1),
+	}
+
+	msg := testOutboundMessage(bus.OutboundMessage{
+		Channel: "test",
+		ChatID:  "123",
+		Context: bus.InboundContext{
+			Channel: "test",
+			ChatID:  "123",
+			Raw: map[string]string{
+				"message_kind": "tool_calls",
+				"tool_calls":   `[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"},"extra_content":{"tool_feedback_explanation":"Looking up config"}}]`,
+			},
+		},
+	})
+
+	m.sendWithRetry(context.Background(), "test", w, msg)
+
+	if ch.deleteCalls != 1 {
+		t.Fatalf("expected placeholder deletion, got %d delete calls", ch.deleteCalls)
+	}
+	if ch.deletedChatID != "123" || ch.deletedMessageID != "456" {
+		t.Fatalf("unexpected placeholder deletion target: %s/%s", ch.deletedChatID, ch.deletedMessageID)
+	}
+	if len(ch.sentMessages) != 1 {
+		t.Fatalf("expected structured tool_calls message to be sent once, got %d", len(ch.sentMessages))
+	}
+}
+
 func TestPreSend_NonToolFeedbackSeparateMessagesClearsTrackedMessageWithoutDismiss(t *testing.T) {
 	m := newTestManager()
 	m.config = &config.Config{

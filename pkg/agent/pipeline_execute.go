@@ -80,13 +80,12 @@ toolLoop:
 						},
 					)
 
-					if shouldPublishToolFeedback(al.cfg, ts) {
+					if shouldPublishToolFeedback(al.cfg, ts) && ts.channel != "pico" {
 						toolFeedbackMaxLen := al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength()
 						toolFeedbackExplanation := toolFeedbackExplanationForToolCall(
 							exec.response,
 							tc,
 							messages,
-							toolFeedbackMaxLen,
 						)
 						feedbackMsg := utils.FormatToolFeedbackMessage(
 							toolName,
@@ -362,13 +361,12 @@ toolLoop:
 			},
 		)
 
-		if shouldPublishToolFeedback(al.cfg, ts) {
+		if shouldPublishToolFeedback(al.cfg, ts) && ts.channel != "pico" {
 			toolFeedbackMaxLen := al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength()
 			toolFeedbackExplanation := toolFeedbackExplanationForToolCall(
 				exec.response,
 				tc,
 				messages,
-				toolFeedbackMaxLen,
 			)
 			feedbackMsg := utils.FormatToolFeedbackMessage(
 				toolName,
@@ -706,6 +704,9 @@ toolLoop:
 		}
 		ts.setPhase(TurnPhaseCompleted)
 		ts.setFinalContent("")
+		if al.channelManager != nil && ts.channel != "" {
+			al.channelManager.DismissToolFeedback(ctx, ts.channel, ts.chatID, ts.opts.InboundContext)
+		}
 		logger.InfoCF("agent", "Tool output satisfied delivery; ending turn without follow-up LLM",
 			map[string]any{
 				"agent_id":   ts.agent.ID,

@@ -437,6 +437,9 @@
       "enabled": true,
       "mode": "bytes"
     },
+    "serial": {
+      "enabled": false
+    },
     "send_tts": {
       "enabled": false
     },

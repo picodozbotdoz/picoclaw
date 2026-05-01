@@ -115,7 +115,6 @@ func latestUserContent(messages []providers.Message) string {
 func toolFeedbackExplanationFromResponse(
 	response *providers.LLMResponse,
 	messages []providers.Message,
-	maxLen int,
 ) string {
 	if response == nil {
 		return ""
@@ -127,7 +126,7 @@ func toolFeedbackExplanationFromResponse(
 	if explanation == "" {
 		explanation = toolFeedbackExplanationFromMessages(messages)
 	}
-	return utils.Truncate(explanation, maxLen)
+	return explanation
 }
 
 func toolFeedbackExplanationFromToolCalls(toolCalls []providers.ToolCall) string {
@@ -146,22 +145,21 @@ func toolFeedbackExplanationForToolCall(
 	response *providers.LLMResponse,
 	toolCall providers.ToolCall,
 	messages []providers.Message,
-	maxLen int,
 ) string {
 	if toolCall.ExtraContent != nil {
 		if explanation := strings.TrimSpace(toolCall.ExtraContent.ToolFeedbackExplanation); explanation != "" {
-			return utils.Truncate(explanation, maxLen)
+			return explanation
 		}
 	}
 	if response == nil {
-		return utils.Truncate(toolFeedbackExplanationFromMessages(messages), maxLen)
+		return toolFeedbackExplanationFromMessages(messages)
 	}
 
 	explanation := strings.TrimSpace(response.Content)
 	if explanation == "" {
 		explanation = toolFeedbackExplanationFromMessages(messages)
 	}
-	return utils.Truncate(explanation, maxLen)
+	return explanation
 }
 
 func toolFeedbackExplanationFromMessages(messages []providers.Message) string {

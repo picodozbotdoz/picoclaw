@@ -435,6 +435,9 @@ func DefaultConfig() *Config {
 				Mode:            ReadFileModeBytes,
 				MaxReadFileSize: 64 * 1024, // 64KB
 			},
+			Serial: ToolConfig{
+				Enabled: false, // Hardware tool - requires host serial ports
+			},
 			Spawn: ToolConfig{
 				Enabled: true,
 			},

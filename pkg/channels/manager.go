@@ -134,6 +134,14 @@ func outboundMessageIsToolFeedback(msg bus.OutboundMessage) bool {
 	return strings.EqualFold(strings.TrimSpace(msg.Context.Raw["message_kind"]), "tool_feedback")
 }
 
+func outboundMessageBypassesPlaceholderEdit(msg bus.OutboundMessage) bool {
+	if len(msg.Context.Raw) == 0 {
+		return false
+	}
+	kind := strings.TrimSpace(msg.Context.Raw["message_kind"])
+	return strings.EqualFold(kind, "thought") || strings.EqualFold(kind, "tool_calls")
+}
+
 func outboundMediaChannel(msg bus.OutboundMediaMessage) string {
 	return msg.Context.Channel
 }
@@ -182,6 +190,21 @@ func clearTrackedToolFeedbackMessage(
 	if tracker, ok := ch.(toolFeedbackMessageTracker); ok {
 		tracker.ClearToolFeedbackMessage(trackedChatID)
 	}
+}
+
+// DismissToolFeedback clears any tracked tool feedback animation for the
+// given channel/chat. This is called when a turn ends without a final
+// response (e.g., ResponseHandled tools) to stop orphaned animation goroutines.
+// outboundCtx carries topic/thread info for channels that use scoped tracker
+// keys (e.g., Telegram forum topics); may be nil for non-topic channels.
+func (m *Manager) DismissToolFeedback(
+	ctx context.Context, channelName, chatID string, outboundCtx *bus.InboundContext,
+) {
+	ch, ok := m.GetChannel(channelName)
+	if !ok {
+		return
+	}
+	dismissTrackedToolFeedbackMessage(ctx, ch, chatID, outboundCtx)
 }
 
 func prepareToolFeedbackMessageContent(ch Channel, content string) string {
@@ -327,6 +350,12 @@ func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMess
 	if v, loaded := m.placeholders.LoadAndDelete(key); loaded {
 		if entry, ok := v.(placeholderEntry); ok && entry.id != "" {
 			if isToolFeedback && separateToolFeedbackMessages {
+				if deleter, ok := ch.(MessageDeleter); ok {
+					deleter.DeleteMessage(ctx, chatID, entry.id) // best effort
+				}
+				return nil, false
+			}
+			if outboundMessageBypassesPlaceholderEdit(msg) {
 				if deleter, ok := ch.(MessageDeleter); ok {
 					deleter.DeleteMessage(ctx, chatID, entry.id) // best effort
 				}
