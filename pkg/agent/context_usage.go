@@ -14,6 +14,8 @@ import (
 //      compress when: history + system + tools + maxTokens > contextWindow
 //      equivalent to: history + system + tools > contextWindow - maxTokens
 //
+// When the agent has a ContextPartition configuration, per-partition token
+// utilization is also computed for budget enforcement telemetry.
 // Returns nil when the agent or session is unavailable.
 func computeContextUsage(agent *AgentInstance, sessionKey string) *bus.ContextUsage {
         if agent == nil || agent.Sessions == nil {
@@ -70,12 +72,25 @@ func computeContextUsage(agent *AgentInstance, sessionKey string) *bus.ContextUs
                 usedPercent = 100
         }
 
-        return &bus.ContextUsage{
+        usage := &bus.ContextUsage{
                 UsedTokens:       usedTokens,
                 TotalTokens:      contextWindow,
                 CompressAtTokens: compressAt,
                 UsedPercent:      usedPercent,
         }
+
+        // WS 3.3: Populate partition breakdown when ContextPartition is configured.
+        // This provides per-partition token utilization for budget enforcement
+        // and monitoring, enabling "full codebase in context" workflows.
+        if agent.ContextPartition != nil {
+                usage.SystemPromptTokens = systemTokens
+                usage.HistoryTokens = historyTokens
+                usage.ToolDefTokens = toolTokens
+                // InjectedContextTokens is populated dynamically when content is
+                // injected into the retrieved context partition (Phase 4, WS 4.1).
+        }
+
+        return usage
 }
 
 // UpdateCacheStats populates cache-related fields on a ContextUsage from
@@ -92,5 +107,30 @@ func UpdateCacheStats(usage *bus.ContextUsage, respUsage *protocoltypes.UsageInf
         // total and prompt_cache_hit_tokens is the subset served from cache.
         if respUsage.PromptTokens > respUsage.PromptCacheHitTokens {
                 usage.CacheMissTokens = respUsage.PromptTokens - respUsage.PromptCacheHitTokens
+        }
+}
+
+// UpdateUsageFromAPI replaces heuristic token estimates with accurate counts
+// from the provider API response. When streaming with include_usage or using
+// non-streaming calls that return usage data, the API reports exact
+// prompt_tokens, completion_tokens, and prompt_cache_hit_tokens.
+// This is more accurate than the EstimateMessageTokens heuristic and should
+// be preferred whenever API usage data is available.
+func UpdateUsageFromAPI(usage *bus.ContextUsage, respUsage *protocoltypes.UsageInfo) {
+        if usage == nil || respUsage == nil {
+                return
+        }
+        // Update cache stats
+        UpdateCacheStats(usage, respUsage)
+
+        // Update reasoning and output token breakdown
+        if respUsage.CompletionTokens > 0 {
+                usage.OutputTokens = respUsage.CompletionTokens
+        }
+        // CompletionTokensDetails may contain reasoning token info
+        if respUsage.CompletionTokensDetails != nil {
+                if respUsage.CompletionTokensDetails.ReasoningTokens > 0 {
+                        usage.ReasoningTokens = respUsage.CompletionTokensDetails.ReasoningTokens
+                }
         }
 }

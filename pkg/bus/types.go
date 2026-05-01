@@ -77,6 +77,18 @@ type ContextUsage struct {
         // effectively by the provider's automatic prefix caching.
         CacheHitTokens  int `json:"cache_hit_tokens,omitempty"`  // Tokens served from prefix cache
         CacheMissTokens int `json:"cache_miss_tokens,omitempty"` // Tokens computed fresh (cache miss)
+
+        // DeepSeek V4 reasoning tokens (populated from API usage data).
+        // Indicates how many tokens were used for reasoning_content (thinking).
+        ReasoningTokens int `json:"reasoning_tokens,omitempty"` // Tokens used for reasoning/thinking
+        OutputTokens    int `json:"output_tokens,omitempty"`    // Tokens in the final response (completion)
+
+        // Partition breakdown (populated when ContextPartition is configured).
+        // These fields track per-partition token utilization for budget enforcement.
+        SystemPromptTokens    int `json:"system_prompt_tokens,omitempty"`     // System prompt partition usage
+        HistoryTokens         int `json:"history_tokens,omitempty"`           // Conversation history partition usage
+        InjectedContextTokens int `json:"injected_context_tokens,omitempty"` // Retrieved/injected context partition usage
+        ToolDefTokens         int `json:"tool_def_tokens,omitempty"`          // Tool definition tokens
 }
 
 type OutboundMessage struct {

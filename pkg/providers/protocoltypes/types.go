@@ -51,6 +51,16 @@ type UsageInfo struct {
         // prompt_cache_hit_tokens in the usage block. A non-zero value
         // indicates a cache hit, which is billed at the lower cache-hit rate.
         PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
+        // CompletionTokensDetails provides a breakdown of completion tokens.
+        // When available, this includes reasoning tokens used for thinking.
+        CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// CompletionTokensDetails breaks down completion tokens into categories.
+// This is populated by providers that report detailed token usage (e.g.,
+// OpenAI's completion_tokens_details.reasoning_tokens).
+type CompletionTokensDetails struct {
+        ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // CacheControl marks a content block for LLM-side prefix caching.

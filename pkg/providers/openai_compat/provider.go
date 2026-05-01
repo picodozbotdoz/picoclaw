@@ -513,6 +513,16 @@ func (p *Provider) ChatStream(
         requestBody := p.buildRequestBody(messages, tools, model, options)
         requestBody["stream"] = true
 
+        // WS 3.2: Request include_usage in streaming mode for accurate token counts.
+        // DeepSeek V4 and OpenAI support stream_options.include_usage to return
+        // prompt_tokens, completion_tokens, and prompt_cache_hit_tokens in the
+        // final streaming chunk. This replaces heuristic token estimation.
+        if includeUsage, _ := options["stream_include_usage"].(bool); includeUsage {
+                requestBody["stream_options"] = map[string]any{
+                        "include_usage": true,
+                }
+        }
+
         jsonData, err := json.Marshal(requestBody)
         if err != nil {
                 return nil, fmt.Errorf("failed to marshal request: %w", err)

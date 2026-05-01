@@ -73,12 +73,33 @@ func (p *Pipeline) CallLLM(
         if exec.useNativeSearch {
                 exec.llmOpts["native_search"] = true
         }
-        if ts.agent.ThinkingLevel != ThinkingOff {
+
+        // WS 3.1: Dynamic thinking level — resolve per-iteration based on context.
+        // The configured ThinkingLevel is the baseline; dynamic mode can switch to
+        // non-think after tool execution for cost/latency optimization.
+        dynamicMode := parseDynamicThinkingMode(ts.agent.DynamicThinkingMode)
+        steeringResumed := iteration > 1 && len(exec.pendingMessages) > 0 && !exec.postToolCall
+        effectiveLevel, reason := resolveThinkingLevelForIteration(
+                ts.agent.ThinkingLevel,
+                dynamicMode,
+                iteration,
+                exec.postToolCall,
+                steeringResumed,
+                exec.isRetry,
+        )
+        exec.dynamicThinkingLevel = effectiveLevel
+        exec.thinkingModeStats = append(exec.thinkingModeStats, ThinkingModeStat{
+                Iteration:     iteration,
+                ThinkingLevel: effectiveLevel,
+                Reason:        reason,
+        })
+
+        if effectiveLevel != ThinkingOff {
                 if tc, ok := ts.agent.Provider.(providers.ThinkingCapable); ok && tc.SupportsThinking() {
-                        exec.llmOpts["thinking_level"] = string(ts.agent.ThinkingLevel)
+                        exec.llmOpts["thinking_level"] = string(effectiveLevel)
                 } else {
                         logger.WarnCF("agent", "thinking_level is set but current provider does not support it, ignoring",
-                                map[string]any{"agent_id": ts.agent.ID, "thinking_level": string(ts.agent.ThinkingLevel)})
+                                map[string]any{"agent_id": ts.agent.ID, "thinking_level": string(effectiveLevel)})
                 }
         }
         // DeepSeek V4 strict mode for tool calls (Beta).
@@ -162,6 +183,17 @@ func (p *Pipeline) CallLLM(
 
                 al.activeRequests.Add(1)
                 defer al.activeRequests.Done()
+
+                // WS 3.2: Streaming integration — check if streaming should be used
+                // based on StreamingMode config and provider capability.
+                useStreaming := shouldUseStreaming(ts.agent, exec.activeProvider)
+
+                if useStreaming {
+                        // Use streaming provider for reduced TTFT and accurate usage data
+                        if sp, ok := exec.activeProvider.(providers.StreamingProvider); ok {
+                                return callWithStreaming(al, sp, exec, providerCtx, messagesForCall, toolDefsForCall, ts)
+                        }
+                }
 
                 if len(exec.activeCandidates) > 1 && p.Fallback != nil {
                         fbResult, fbErr := p.Fallback.Execute(
@@ -529,4 +561,81 @@ func (p *Pipeline) CallLLM(
         }
 
         return ControlToolLoop, nil
+}
+
+// shouldUseStreaming determines whether streaming should be used for an LLM call
+// based on the agent's StreamingMode configuration and provider capability.
+// Returns true when streaming should be used, false otherwise.
+func shouldUseStreaming(agent *AgentInstance, provider providers.LLMProvider) bool {
+        mode := agent.StreamingMode
+        switch strings.ToLower(strings.TrimSpace(mode)) {
+        case "always":
+                // Force streaming — will fail at call time if provider doesn't support it
+                _, ok := provider.(providers.StreamingProvider)
+                return ok
+        case "never":
+                return false
+        default: // "auto" or empty
+                // Auto: use streaming if provider supports it
+                _, ok := provider.(providers.StreamingProvider)
+                return ok
+        }
+}
+
+// callWithStreaming executes a streaming LLM call with onChunk callback.
+// The onChunk callback is used to emit partial content events for real-time
+// display in channels that support it. The final LLMResponse is returned
+// with the same structure as a non-streaming call for compatibility.
+func callWithStreaming(
+        al *AgentLoop,
+        sp providers.StreamingProvider,
+        exec *turnExecution,
+        ctx context.Context,
+        messages []providers.Message,
+        tools []providers.ToolDefinition,
+        ts *turnState,
+) (*providers.LLMResponse, error) {
+        // Request include_usage in streaming mode for accurate token counts.
+        // This is passed via llmOpts so the provider can add stream_options.
+        opts := exec.llmOpts
+        if opts == nil {
+                opts = make(map[string]any)
+        }
+        opts["stream_include_usage"] = true
+
+        // onChunk receives accumulated text and can be used for real-time
+        // partial content display in channels that support it.
+        onChunk := func(accumulated string) {
+                // Emit partial content for real-time display.
+                // Channels like Telegram and Pico support partial updates.
+                // This is a lightweight callback — no heavy processing here.
+                if ts.channel == "pico" || ts.channel == "telegram" {
+                        al.emitEvent(
+                                EventKindLLMDelta,
+                                ts.eventMeta("runTurn", "turn.llm.delta"),
+                                LLMDeltaPayload{
+                                        ContentDeltaLen: len(accumulated),
+                                },
+                        )
+                }
+        }
+
+        resp, err := sp.ChatStream(ctx, messages, tools, exec.llmModel, opts, onChunk)
+        if err != nil {
+                return nil, err
+        }
+
+        // Log streaming-specific usage data if available
+        if resp.Usage != nil {
+                logger.DebugCF("agent", "Streaming LLM response usage",
+                        map[string]any{
+                                "agent_id":            ts.agent.ID,
+                                "prompt_tokens":       resp.Usage.PromptTokens,
+                                "completion_tokens":   resp.Usage.CompletionTokens,
+                                "total_tokens":        resp.Usage.TotalTokens,
+                                "cache_hit_tokens":    resp.Usage.PromptCacheHitTokens,
+                        })
+        }
+
+        return resp, nil
 }

@@ -39,6 +39,9 @@ type AgentInstance struct {
         ResponseFormat            string
         CompressionStrategy       string // "eager", "adaptive", "conservative"
         FullContextMode           bool   // disables summarization, only emergency compression
+        StreamingMode             string // "auto" (default), "always", "never"
+        DynamicThinkingMode       string // "auto" (dynamic switching), "fixed" (always use configured level)
+        ContextPartition          *config.ContextPartitionConfig // partition-based context budget allocation
         Provider                  providers.LLMProvider
         Sessions                  session.SessionStore
         ContextBuilder            *ContextBuilder
@@ -250,6 +253,22 @@ func NewAgentInstance(
                 compressionStrategy = "eager"
         }
         fullContextMode := defaults.FullContextMode
+        streamingMode := defaults.StreamingMode
+        if streamingMode == "" {
+                streamingMode = "auto"
+        }
+        dynamicThinkingMode := defaults.DynamicThinkingMode
+        if dynamicThinkingMode == "" {
+                dynamicThinkingMode = "auto"
+        }
+
+        // ContextPartition from ModelConfig (optional, enables partition-based budget enforcement)
+        var contextPartition *config.ContextPartitionConfig
+        if mc, err := cfg.GetModelConfig(model); err == nil && mc.ContextPartition != nil {
+                if effective := mc.ContextPartition.Effective(); effective != nil {
+                        contextPartition = effective
+                }
+        }
 
         // Resolve fallback candidates
         candidates := resolveModelCandidates(cfg, defaults.Provider, model, fallbacks)
@@ -308,6 +327,9 @@ func NewAgentInstance(
                 ResponseFormat:            responseFormat,
                 CompressionStrategy:       compressionStrategy,
                 FullContextMode:           fullContextMode,
+                StreamingMode:             streamingMode,
+                DynamicThinkingMode:       dynamicThinkingMode,
+                ContextPartition:          contextPartition,
                 Provider:                  provider,
                 Sessions:                  sessions,
                 ContextBuilder:            contextBuilder,

@@ -282,6 +282,12 @@ type AgentDefaults struct {
         // FullContextMode disables summarization entirely for models with very large context
         // windows (e.g., DeepSeek V4 1M). Only emergency compression on context overflow is allowed.
         FullContextMode bool `json:"full_context_mode,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_FULL_CONTEXT_MODE"`
+        // StreamingMode controls streaming LLM call behavior in the agent pipeline.
+        // Supported values: "auto" (default, use streaming if provider supports it), "always" (force streaming), "never" (force non-streaming)
+        StreamingMode string `json:"streaming_mode,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_STREAMING_MODE"`
+        // DynamicThinkingMode controls automatic thinking level switching between iterations.
+        // Supported values: "auto" (switch to non-think after tool execution), "fixed" (always use configured level)
+        DynamicThinkingMode string `json:"dynamic_thinking_mode,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_DYNAMIC_THINKING_MODE"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
@@ -542,6 +548,83 @@ type VoiceConfig struct {
 // Supported providers include openai, anthropic, antigravity, claude-cli,
 // codex-cli, github-copilot, and named OpenAI-compatible protocols such as
 // groq, deepseek, modelscope, and novita.
+// ContextPartitionConfig defines percentage-based allocation of the context window
+// into logical partitions. This enables deliberate budget management for models
+// with very large context windows (e.g., DeepSeek V4 1M), allowing "full codebase
+// in context" workflows by reserving dedicated space for injected documents.
+//
+// When all fields are 0, partition-based budget enforcement is disabled and the
+// default flat budget model is used. When any field is set, all fields should sum
+// to 100%; if they don't, the system normalizes proportionally.
+type ContextPartitionConfig struct {
+        SystemPromptPct     float64 `json:"system_prompt_pct,omitempty"`      // % for system prompt (default: 2%)
+        WorkingMemoryPct    float64 `json:"working_memory_pct,omitempty"`     // % for working memory/scratchpad (default: 3%)
+        RetrievedContextPct float64 `json:"retrieved_context_pct,omitempty"` // % for injected documents/code (default: 60%)
+        HistoryPct          float64 `json:"history_pct,omitempty"`           // % for conversation history (default: 30%)
+        OutputPct           float64 `json:"output_pct,omitempty"`            // % reserved for output (default: 5%)
+}
+
+// Validate checks that the partition percentages are valid.
+// Returns nil if the config is empty (all zeros = disabled).
+func (c *ContextPartitionConfig) Validate() error {
+        total := c.SystemPromptPct + c.WorkingMemoryPct + c.RetrievedContextPct + c.HistoryPct + c.OutputPct
+        if total == 0 {
+                return nil // disabled
+        }
+        if anyNegative(c.SystemPromptPct, c.WorkingMemoryPct, c.RetrievedContextPct, c.HistoryPct, c.OutputPct) {
+                return fmt.Errorf("context_partition percentages must be non-negative")
+        }
+        if total < 99 || total > 101 {
+                return fmt.Errorf("context_partition percentages must sum to 100%%, got %.1f%%", total)
+        }
+        return nil
+}
+
+// Effective returns a normalized copy with defaults filled in for zero fields.
+// If all fields are zero (disabled), returns nil.
+func (c *ContextPartitionConfig) Effective() *ContextPartitionConfig {
+        total := c.SystemPromptPct + c.WorkingMemoryPct + c.RetrievedContextPct + c.HistoryPct + c.OutputPct
+        if total == 0 {
+                return nil
+        }
+        result := *c
+        if result.SystemPromptPct == 0 {
+                result.SystemPromptPct = 2
+        }
+        if result.WorkingMemoryPct == 0 {
+                result.WorkingMemoryPct = 3
+        }
+        if result.RetrievedContextPct == 0 {
+                result.RetrievedContextPct = 60
+        }
+        if result.HistoryPct == 0 {
+                result.HistoryPct = 30
+        }
+        if result.OutputPct == 0 {
+                result.OutputPct = 5
+        }
+        // Normalize to exactly 100%
+        total = result.SystemPromptPct + result.WorkingMemoryPct + result.RetrievedContextPct + result.HistoryPct + result.OutputPct
+        if total != 100 {
+                scale := 100.0 / total
+                result.SystemPromptPct *= scale
+                result.WorkingMemoryPct *= scale
+                result.RetrievedContextPct *= scale
+                result.HistoryPct *= scale
+                result.OutputPct *= scale
+        }
+        return &result
+}
+
+func anyNegative(vals ...float64) bool {
+        for _, v := range vals {
+                if v < 0 {
+                        return true
+                }
+        }
+        return false
+}
+
 type ModelConfig struct {
         // Required fields
         ModelName string `json:"model_name"` // User-facing alias for the model
@@ -592,6 +675,14 @@ type ModelConfig struct {
         // When "json_object" is set, the system or user message must include
         // JSON formatting instructions (required by the API).
         ResponseFormat string `json:"response_format,omitempty" yaml:"response_format,omitempty"`
+
+        // ContextPartition configures deliberate context window budget allocation
+        // for models with very large context windows (e.g., DeepSeek V4 1M).
+        // When set, percentages must sum to 100%. Each field represents the
+        // percentage of the context window allocated to that partition.
+        // This enables "full codebase in context" workflows by reserving space
+        // for injected documents separately from conversation history.
+        ContextPartition *ContextPartitionConfig `json:"context_partition,omitempty" yaml:"context_partition,omitempty"`
 
         APIKeys SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty"` // API authentication keys (multiple keys for failover)
 
