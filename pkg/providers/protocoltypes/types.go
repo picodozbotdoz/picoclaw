@@ -93,6 +93,19 @@ type Message struct {
         ToolCalls        []ToolCall     `json:"tool_calls,omitempty"`
         ToolCallID       string         `json:"tool_call_id,omitempty"`
 
+        // CacheBoundaryIndex records the number of stable (cacheable) content blocks
+        // at the start of SystemParts. Provider adapters (especially DeepSeek V4's
+        // openai_compat provider) can use this to determine where the prefix cache
+        // boundary lies: blocks [0, CacheBoundaryIndex) are stable across calls,
+        // blocks [CacheBoundaryIndex, ...) are volatile. Internal only — not
+        // serialized to the provider API.
+        CacheBoundaryIndex int `json:"-"`
+
+        // PrefixHash is a lightweight FNV-1a fingerprint of the stable prefix
+        // content. It allows consumers to detect when the cacheable prefix has
+        // changed between calls (cache break). Internal only.
+        PrefixHash uint64 `json:"-"`
+
         // Prompt metadata is internal to the agent runtime. It records where a
         // message or system part came from without changing provider/session JSON.
         PromptLayer  string `json:"-"`
