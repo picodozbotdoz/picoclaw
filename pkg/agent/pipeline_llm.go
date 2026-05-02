@@ -13,6 +13,8 @@ import (
         "github.com/sipeed/picoclaw/pkg/constants"
         "github.com/sipeed/picoclaw/pkg/logger"
         "github.com/sipeed/picoclaw/pkg/providers"
+        "github.com/sipeed/picoclaw/pkg/providers/openai_compat"
+        "github.com/sipeed/picoclaw/pkg/tokenizer"
 )
 
 // CallLLM performs an LLM call with fallback support, hook invocation, and retry logic.
@@ -85,8 +87,15 @@ func (p *Pipeline) CallLLM(
         // WS 3.1: Dynamic thinking level — resolve per-iteration based on context.
         // The configured ThinkingLevel is the baseline; dynamic mode can switch to
         // non-think after tool execution for cost/latency optimization.
+        // The complexity score enables three-tier dynamic thinking: complex tasks
+        // get boosted to think-max/xhigh, while simple post-tool iterations use
+        // non-think mode for speed.
         dynamicMode := parseDynamicThinkingMode(ts.agent.DynamicThinkingMode)
         steeringResumed := iteration > 1 && len(exec.pendingMessages) > 0 && !exec.postToolCall
+        complexity := 0.0
+        if ts.agent.Router != nil {
+                _, _, complexity = ts.agent.Router.SelectModel(ts.userMessage, exec.history, ts.agent.Model)
+        }
         effectiveLevel, reason := resolveThinkingLevelForIteration(
                 ts.agent.ThinkingLevel,
                 dynamicMode,
@@ -94,6 +103,7 @@ func (p *Pipeline) CallLLM(
                 exec.postToolCall,
                 steeringResumed,
                 exec.isRetry,
+                complexity,
         )
         exec.dynamicThinkingLevel = effectiveLevel
         exec.thinkingModeStats = append(exec.thinkingModeStats, ThinkingModeStat{
@@ -111,7 +121,34 @@ func (p *Pipeline) CallLLM(
                 }
         }
         // DeepSeek V4 strict mode for tool calls (Beta).
+        // Validate tool schemas for strict mode compliance before sending.
+        // The provider layer also validates (in buildStrictToolsList), but this
+        // agent-layer check provides an earlier warning and can disable strict
+        // mode entirely if schemas are non-compliant, avoiding 400 API errors.
         if ts.agent.StrictToolCalls {
+                if len(exec.providerToolDefs) > 0 {
+                        invalidCount := 0
+                        for _, td := range exec.providerToolDefs {
+                                if td.Function.Parameters != nil {
+                                        if schemaMap, ok := td.Function.Parameters.(map[string]any); ok {
+                                                if result := openai_compat.ValidateStrictSchema(schemaMap, td.Function.Name); !result.Valid {
+                                                        invalidCount++
+                                                        if len(result.Errors) > 0 {
+                                                                logger.WarnCF("agent", "Strict mode schema validation error",
+                                                                        map[string]any{
+                                                                                "function": td.Function.Name,
+                                                                                "errors":   strings.Join(result.Errors, "; "),
+                                                                        })
+                                                        }
+                                                }
+                                        }
+                                }
+                        }
+                        if invalidCount > 0 {
+                                logger.WarnCF("agent", "Strict mode: some tool schemas invalid, provider will auto-sanitize",
+                                        map[string]any{"invalid_count": invalidCount, "total_tools": len(exec.providerToolDefs)})
+                        }
+                }
                 exec.llmOpts["strict_tool_calls"] = true
         }
         // DeepSeek V4 response format (json_object for guaranteed JSON output).
@@ -502,6 +539,20 @@ func (p *Pipeline) CallLLM(
                 if ts.agent.CostTracker != nil {
                         ts.agent.CostTracker.RecordLLMUsage(exec.llmModel, exec.response.Usage)
                 }
+                // Token estimator feedback loop: refine the per-model tokens-per-character
+                // ratio from actual API usage. This improves the accuracy of future
+                // EstimateMessageTokens calls when API usage data isn't available yet,
+                // reducing the 20-40% error rate of the generic chars*2/5 heuristic.
+                if exec.response.Usage.PromptTokens > 0 && len(exec.callMessages) > 0 {
+                        totalInputChars := 0
+                        for _, m := range exec.callMessages {
+                                totalInputChars += len(m.Content) + len(m.ReasoningContent)
+                        }
+                        if totalInputChars > 0 {
+                                ratio := float64(exec.response.Usage.PromptTokens) / float64(totalInputChars)
+                                tokenizer.UpdateModelTokenRate(exec.llmModel, ratio)
+                        }
+                }
         }
 
         // No-tool-call path: steering check and direct response
@@ -638,6 +689,12 @@ func shouldUseStreaming(agent *AgentInstance, provider providers.LLMProvider) bo
 // with the same structure as a non-streaming call for compatibility.
 // The model parameter specifies which model to request; when called from the
 // fallback path it differs from exec.llmModel (which is the primary model).
+//
+// If the stream fails after partial content has been received, the function
+// returns a best-effort response with the accumulated text and a heuristic
+// usage estimate, rather than propagating the error. This prevents total
+// loss of long-running streaming responses when the connection is interrupted
+// after the model has already generated substantial content.
 func callWithStreaming(
         al *AgentLoop,
         sp providers.StreamingProvider,
@@ -656,9 +713,13 @@ func callWithStreaming(
         }
         opts["stream_include_usage"] = true
 
+        // Track accumulated content for graceful fallback on stream interruption.
+        var accumulatedText string
+
         // onChunk receives accumulated text and can be used for real-time
         // partial content display in channels that support it.
         onChunk := func(accumulated string) {
+                accumulatedText = accumulated
                 // Emit partial content for real-time display.
                 // Channels like Telegram and Pico support partial updates.
                 // This is a lightweight callback — no heavy processing here.
@@ -675,6 +736,31 @@ func callWithStreaming(
 
         resp, err := sp.ChatStream(ctx, messages, tools, model, opts, onChunk)
         if err != nil {
+                // Graceful fallback: if the stream was interrupted after generating
+                // substantial content, return a partial response rather than an error.
+                // This handles common failure modes like connection drops, timeouts,
+                // and provider-side interruptions during long streaming responses.
+                if accumulatedText != "" {
+                        logger.WarnCF("agent", "Stream failed, returning partial response",
+                                map[string]any{
+                                        "error":       err.Error(),
+                                        "partial_len": len(accumulatedText),
+                                        "model":       model,
+                                })
+                        // Estimate prompt tokens from the input messages
+                        promptEstimate := 0
+                        for _, m := range messages {
+                                promptEstimate += tokenizer.EstimateMessageTokens(m)
+                        }
+                        return &providers.LLMResponse{
+                                Content:      accumulatedText,
+                                FinishReason: "interrupted",
+                                Usage: &providers.UsageInfo{
+                                        PromptTokens:     promptEstimate,
+                                        CompletionTokens: tokenizer.EstimateMessageTokens(providers.Message{Content: accumulatedText}),
+                                },
+                        }, nil
+                }
                 return nil, err
         }
 
@@ -682,11 +768,11 @@ func callWithStreaming(
         if resp.Usage != nil {
                 logger.DebugCF("agent", "Streaming LLM response usage",
                         map[string]any{
-                                "agent_id":            ts.agent.ID,
-                                "prompt_tokens":       resp.Usage.PromptTokens,
-                                "completion_tokens":   resp.Usage.CompletionTokens,
-                                "total_tokens":        resp.Usage.TotalTokens,
-                                "cache_hit_tokens":    resp.Usage.PromptCacheHitTokens,
+                                "agent_id":         ts.agent.ID,
+                                "prompt_tokens":    resp.Usage.PromptTokens,
+                                "completion_tokens": resp.Usage.CompletionTokens,
+                                "total_tokens":     resp.Usage.TotalTokens,
+                                "cache_hit_tokens": resp.Usage.PromptCacheHitTokens,
                         })
         }
 

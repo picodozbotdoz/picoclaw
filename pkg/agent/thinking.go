@@ -73,10 +73,17 @@ type ThinkingModeStat struct {
 // for a given iteration based on the dynamic thinking mode and iteration context.
 //
 // Logic (when DynamicThinkingMode == "auto"):
-//   - First iteration: Use the configured ThinkingLevel (initial reasoning)
+//   - First iteration: Use the configured ThinkingLevel, but boost to XHigh
+//     if the complexity score is high (>0.7) and configured level is High.
 //   - Post-tool-call iteration: Use ThinkingOff (tool result processing is fast)
 //   - Steering-resume iteration: Use the configured ThinkingLevel (new reasoning needed)
 //   - Retry after compression: Use the configured ThinkingLevel
+//
+// The complexityScore parameter (0.0–1.0) comes from the model router's
+// SelectModel function and enables three-tier dynamic thinking:
+//   - non-think (post-tool): fast tool result interpretation
+//   - think-high (normal): standard reasoning
+//   - think-max/xhigh (complex): deep analysis for complex tasks
 //
 // When DynamicThinkingMode == "fixed", always returns the configured level.
 func resolveThinkingLevelForIteration(
@@ -86,21 +93,27 @@ func resolveThinkingLevelForIteration(
         postToolCall bool,
         steeringResumed bool,
         isRetry bool,
+        complexityScore float64,
 ) (ThinkingLevel, string) {
         if dynamicMode == DynamicThinkingFixed || configuredLevel == ThinkingOff {
                 return configuredLevel, "configured"
         }
 
         // Dynamic mode: switch based on context
-        if iteration == 1 {
-                return configuredLevel, "initial"
-        }
-
-        if isRetry {
-                return configuredLevel, "retry"
-        }
-
-        if steeringResumed {
+        if iteration == 1 || isRetry || steeringResumed {
+                // For complex initial/steering/retry turns, boost to higher thinking
+                // if available. This gives the model more reasoning budget when the
+                // task complexity warrants it (e.g., multi-step code refactoring,
+                // complex debugging, or architecture decisions).
+                if configuredLevel == ThinkingHigh && complexityScore > 0.7 {
+                        return ThinkingXHigh, "complexity_boost"
+                }
+                if iteration == 1 {
+                        return configuredLevel, "initial"
+                }
+                if isRetry {
+                        return configuredLevel, "retry"
+                }
                 return configuredLevel, "steering_resume"
         }
 
