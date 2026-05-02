@@ -285,12 +285,25 @@ func (p *Provider) prepareMessagesForRequest(messages []Message, model string, t
                 //
                 // Interleaved Thinking (V4): The V4 paper distinguishes two behaviors:
                 // - Tool-calling scenarios: ALL reasoning preserved across ALL turns
+                //   (preserving the interleaved thinking chain for tool continuity)
                 // - General conversational: reasoning from earlier turns discarded
-                // In practice, preserving all reasoning_content is always safe and provides
-                // the best quality for agent workflows. The drop_thinking optimization is
-                // available via the "drop_thinking" option when token savings are needed.
+                //   (drop_thinking mode for token savings when no tools are involved)
+                //
+                // When tools are present in the request, we ALWAYS preserve all reasoning
+                // content to maintain the interleaved thinking chain. When no tools are
+                // present AND the drop_thinking option is enabled, we strip reasoning from
+                // earlier turns (keeping only the latest assistant turn's reasoning).
                 if isDeepSeekV4ModelName(model) {
-                        return filterDeepSeekV4ReasoningMessages(messages)
+                        toolsPresent := len(tools) > 0 || hasToolInteractions(messages)
+                        if toolsPresent {
+                                // V4 with tools: preserve ALL reasoning for interleaved thinking continuity.
+                                // This is critical — stripping reasoning in tool-calling scenarios breaks
+                                // the model's ability to maintain reasoning context across tool rounds.
+                                return filterDeepSeekV4ReasoningMessages(messages)
+                        }
+                        // V4 without tools: use drop_thinking to save tokens by discarding
+                        // reasoning from earlier turns, keeping only the latest assistant reasoning.
+                        return filterDeepSeekV4ReasoningMessagesDropThinking(messages)
                 }
                 return filterDeepSeekReasoningMessages(messages)
         }
