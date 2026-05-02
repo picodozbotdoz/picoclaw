@@ -745,17 +745,17 @@ func callWithStreaming(
                                         "partial_len": len(accumulatedText),
                                         "model":       model,
                                 })
-                        // Estimate prompt tokens from the input messages
+                        // Estimate prompt tokens from the input messages (model-aware)
                         promptEstimate := 0
                         for _, m := range messages {
-                                promptEstimate += tokenizer.EstimateMessageTokens(m)
+                                promptEstimate += tokenizer.EstimateMessageTokensForModel(m, model)
                         }
                         return &providers.LLMResponse{
                                 Content:      accumulatedText,
                                 FinishReason: "interrupted",
                                 Usage: &providers.UsageInfo{
                                         PromptTokens:     promptEstimate,
-                                        CompletionTokens: tokenizer.EstimateMessageTokens(providers.Message{Content: accumulatedText}),
+                                        CompletionTokens: tokenizer.EstimateMessageTokensForModel(providers.Message{Content: accumulatedText}, model),
                                 },
                         }, nil
                 }

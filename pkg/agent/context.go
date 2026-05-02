@@ -20,6 +20,7 @@ import (
         "github.com/sipeed/picoclaw/pkg/providers"
         "github.com/sipeed/picoclaw/pkg/skills"
         "github.com/sipeed/picoclaw/pkg/utils"
+        "github.com/sipeed/picoclaw/pkg/tokenizer"
 )
 
 type ContextBuilder struct {
@@ -370,7 +371,7 @@ func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []st
                 totalChars += 7 // separator
         }
 
-        return totalChars * 2 / 5 // same heuristic as tokenizer.EstimateMessageTokens
+        return int(float64(totalChars) * tokenizer.DefaultTokensPerChar) // same heuristic as tokenizer.EstimateMessageTokens
 }
 
 // InvalidateCache clears the cached system prompt.

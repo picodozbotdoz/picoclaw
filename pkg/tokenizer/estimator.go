@@ -55,7 +55,9 @@ func GetModelTokenRate(model string) float64 {
 
 // EstimateMessageTokens estimates the token count for a single message,
 // including Content, ReasoningContent, ToolCalls arguments, ToolCallID
-// metadata, and Media items. Uses a heuristic of 2.5 characters per token.
+// metadata, and Media items. Uses the generic heuristic of 2.5 characters
+// per token (DefaultTokensPerChar). For model-aware estimation that uses
+// per-model learned ratios, use EstimateMessageTokensForModel instead.
 func EstimateMessageTokens(msg providers.Message) int {
         contentChars := utf8.RuneCountInString(msg.Content)
 
@@ -100,7 +102,8 @@ func EstimateMessageTokens(msg providers.Message) int {
         const messageOverhead = 12
         chars += messageOverhead
 
-        tokens := chars * 2 / 5
+        ratio := DefaultTokensPerChar
+        tokens := int(float64(chars) * ratio)
 
         // Media items (images, files) are serialized by provider adapters into
         // multipart or image_url payloads. Add a fixed per-item token estimate
@@ -112,8 +115,81 @@ func EstimateMessageTokens(msg providers.Message) int {
         return tokens
 }
 
+// EstimateMessageTokensForModel estimates the token count for a single message
+// using a model-specific tokens-per-character ratio when available. If the model
+// has been observed in prior LLM calls (via UpdateModelTokenRate), the learned
+// ratio is used instead of the generic 2.5 chars/token heuristic, reducing the
+// 20-40% error rate for models with different tokenizers (e.g., DeepSeek V4).
+func EstimateMessageTokensForModel(msg providers.Message, model string) int {
+        contentChars := utf8.RuneCountInString(msg.Content)
+
+        systemPartsChars := 0
+        if len(msg.SystemParts) > 0 {
+                for _, part := range msg.SystemParts {
+                        systemPartsChars += utf8.RuneCountInString(part.Text)
+                }
+                const perPartOverhead = 20
+                systemPartsChars += len(msg.SystemParts) * perPartOverhead
+        }
+
+        chars := contentChars
+        if systemPartsChars > chars {
+                chars = systemPartsChars
+        }
+
+        chars += utf8.RuneCountInString(msg.ReasoningContent)
+
+        for _, tc := range msg.ToolCalls {
+                chars += len(tc.ID) + len(tc.Type)
+                if tc.Function != nil {
+                        chars += len(tc.Function.Name) + len(tc.Function.Arguments)
+                } else {
+                        chars += len(tc.Name)
+                }
+        }
+
+        if msg.ToolCallID != "" {
+                chars += len(msg.ToolCallID)
+        }
+
+        const messageOverhead = 12
+        chars += messageOverhead
+
+        ratio := GetModelTokenRate(model)
+        tokens := int(float64(chars) * ratio)
+
+        const mediaTokensPerItem = 256
+        tokens += len(msg.Media) * mediaTokensPerItem
+
+        return tokens
+}
+
+// EstimateToolDefsTokensForModel estimates tool definition tokens using a
+// model-specific ratio when available.
+func EstimateToolDefsTokensForModel(defs []providers.ToolDefinition, model string) int {
+        if len(defs) == 0 {
+                return 0
+        }
+
+        totalChars := 0
+        for _, d := range defs {
+                totalChars += len(d.Function.Name) + len(d.Function.Description)
+
+                if d.Function.Parameters != nil {
+                        if paramJSON, err := json.Marshal(d.Function.Parameters); err == nil {
+                                totalChars += len(paramJSON)
+                        }
+                }
+
+                totalChars += 20
+        }
+
+        ratio := GetModelTokenRate(model)
+        return int(float64(totalChars) * ratio)
+}
+
 // EstimateToolDefsTokens estimates the total token cost of tool definitions
-// as they appear in the LLM request.
+// as they appear in the LLM request. Uses the generic heuristic ratio.
 func EstimateToolDefsTokens(defs []providers.ToolDefinition) int {
         if len(defs) == 0 {
                 return 0
@@ -133,5 +209,5 @@ func EstimateToolDefsTokens(defs []providers.ToolDefinition) int {
                 totalChars += 20
         }
 
-        return totalChars * 2 / 5
+        return int(float64(totalChars) * DefaultTokensPerChar)
 }

@@ -90,30 +90,58 @@ func EstimateMessageTokens(msg providers.Message) int {
         return tokenizer.EstimateMessageTokens(msg)
 }
 
+// EstimateMessageTokensForModel estimates the token count for a single message
+// using a model-specific tokens-per-character ratio when available. When the
+// model has been seen in prior LLM calls, the learned ratio replaces the
+// generic 2.5 chars/token heuristic, reducing the 20-40% error rate for
+// models with different tokenizers (e.g., DeepSeek V4).
+func EstimateMessageTokensForModel(msg providers.Message, model string) int {
+        return tokenizer.EstimateMessageTokensForModel(msg, model)
+}
+
 // EstimateToolDefsTokens estimates the total token cost of tool definitions
 // as they appear in the LLM request. Delegates to the shared tokenizer package.
 func EstimateToolDefsTokens(defs []providers.ToolDefinition) int {
         return tokenizer.EstimateToolDefsTokens(defs)
 }
 
+// EstimateToolDefsTokensForModel estimates tool definition tokens using a
+// model-specific ratio when available.
+func EstimateToolDefsTokensForModel(defs []providers.ToolDefinition, model string) int {
+        return tokenizer.EstimateToolDefsTokensForModel(defs, model)
+}
+
 // isOverContextBudget checks whether the assembled messages plus tool definitions
 // and output reserve would exceed the model's context window. This enables
 // proactive compression before calling the LLM, rather than reacting to 400 errors.
 //
-// When the agent has a ContextPartition configuration, this also checks per-partition
-// budgets (WS 3.3). If a partition overflows, it returns true with the specific reason.
+// When model is non-empty, uses model-aware token estimation (via
+// EstimateMessageTokensForModel) for better accuracy on models whose tokenizers
+// differ from the generic 2.5 chars/token heuristic.
 func isOverContextBudget(
         contextWindow int,
         messages []providers.Message,
         toolDefs []providers.ToolDefinition,
         maxTokens int,
+        model string,
 ) bool {
         msgTokens := 0
-        for _, m := range messages {
-                msgTokens += EstimateMessageTokens(m)
+        if model != "" {
+                for _, m := range messages {
+                        msgTokens += EstimateMessageTokensForModel(m, model)
+                }
+        } else {
+                for _, m := range messages {
+                        msgTokens += EstimateMessageTokens(m)
+                }
         }
 
-        toolTokens := EstimateToolDefsTokens(toolDefs)
+        var toolTokens int
+        if model != "" {
+                toolTokens = EstimateToolDefsTokensForModel(toolDefs, model)
+        } else {
+                toolTokens = EstimateToolDefsTokens(toolDefs)
+        }
         total := msgTokens + toolTokens + maxTokens
 
         return total > contextWindow

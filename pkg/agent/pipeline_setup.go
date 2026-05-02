@@ -42,13 +42,19 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                 var needCompress bool
                 var compressReason string
 
+                // Resolve the active model for model-aware token estimation.
+                // The model name is used to look up per-model tokens-per-character
+                // ratios learned from prior API usage, reducing the 20-40% error
+                // rate of the generic chars*2/5 heuristic.
+                activeModel := ts.agent.Model
+
                 // WS 3.3: Use partition-based budget check when ContextPartition is configured.
                 // This replaces the flat isOverContextBudget with per-partition enforcement,
                 // enabling targeted compression when a specific partition (e.g., history) overflows.
                 if ts.agent.ContextPartition != nil {
                         historyTokens := 0
                         for _, m := range messages {
-                                historyTokens += EstimateMessageTokens(m)
+                                historyTokens += EstimateMessageTokensForModel(m, activeModel)
                         }
                         systemEstimate := 0
                         if ts.agent.ContextBuilder != nil {
@@ -57,7 +63,7 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                                         nil,
                                 )
                         }
-                        toolTokens := EstimateToolDefsTokens(toolDefs)
+                        toolTokens := EstimateToolDefsTokensForModel(toolDefs, activeModel)
                         injectedTokens := 0
                         if ts.agent.InjectedContext != nil {
                                 injectedTokens = ts.agent.InjectedContext.TotalTokens()
@@ -70,13 +76,14 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                                 injectedTokens,
                                 toolTokens,
                                 ts.agent.MaxTokens,
+                                activeModel,
                         )
                         if overflow {
                                 needCompress = true
                                 compressReason = "partition overflow: " + partition
                         }
                 } else {
-                        needCompress = isOverContextBudget(ts.agent.ContextWindow, messages, toolDefs, ts.agent.MaxTokens)
+                        needCompress = isOverContextBudget(ts.agent.ContextWindow, messages, toolDefs, ts.agent.MaxTokens, activeModel)
                         if needCompress {
                                 compressReason = "flat budget exceeded"
                         }
@@ -89,6 +96,8 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                                 SessionKey: ts.sessionKey,
                                 Reason:     ContextCompressReasonProactive,
                                 Budget:     ts.agent.ContextWindow,
+                                Partition:  compressReason,
+                                Model:      activeModel,
                         }); err != nil {
                                 logger.WarnCF("agent", "Proactive compact failed", map[string]any{
                                         "session_key": ts.sessionKey,
