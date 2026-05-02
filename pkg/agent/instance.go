@@ -75,6 +75,14 @@ type AgentInstance struct {
         // CostTracker tracks per-session cost for /cost reporting. Initialized in
         // NewAgentInstance and updated after each LLM response (WS 4.3).
         CostTracker *SessionCostTracker
+
+        // ExplorationConfig controls the structured exploration phase.
+        // When enabled, the agent proactively gathers context before the main loop.
+        ExplorationConfig *config.ExplorationConfig
+
+        // VerificationConfig controls the post-edit verification phase.
+        // When enabled, the agent runs build/test commands after edits.
+        VerificationConfig *config.VerificationConfig
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -368,6 +376,8 @@ func NewAgentInstance(
                 LightProvider:             lightProvider,
                 CandidateProviders:        candidateProviders,
                 CostTracker:               NewSessionCostTracker(),
+                ExplorationConfig:         defaults.Exploration.Effective(),
+                VerificationConfig:        defaults.Verification.Effective(),
         }
 }
 

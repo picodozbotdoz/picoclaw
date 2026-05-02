@@ -24,8 +24,10 @@ type TurnPhase string
 
 const (
         TurnPhaseSetup      TurnPhase = "setup"
+        TurnPhaseExploring  TurnPhase = "exploring"
         TurnPhaseRunning    TurnPhase = "running"
         TurnPhaseTools      TurnPhase = "tools"
+        TurnPhaseVerifying  TurnPhase = "verifying"
         TurnPhaseFinalizing TurnPhase = "finalizing"
         TurnPhaseCompleted  TurnPhase = "completed"
         TurnPhaseAborted    TurnPhase = "aborted"
@@ -151,6 +153,10 @@ type turnExecution struct {
         // Abort signaling for coordinator (set by Pipeline methods)
         abortedByHardAbort bool // true when hard abort triggered during LLM/tools
         abortedByHook      bool // true when HookActionAbortTurn triggered
+
+        // Verification retry counter: incremented each time verification fails
+        // and the coordinator re-enters the loop for the LLM to fix errors.
+        verificationRetries int
 }
 
 // newTurnExecution creates a turnExecution initialized from turnState and options.

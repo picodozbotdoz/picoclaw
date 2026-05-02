@@ -295,6 +295,12 @@ type AgentDefaults struct {
         // DynamicThinkingMode controls automatic thinking level switching between iterations.
         // Supported values: "auto" (switch to non-think after tool execution), "fixed" (always use configured level)
         DynamicThinkingMode string `json:"dynamic_thinking_mode,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_DYNAMIC_THINKING_MODE"`
+        // Exploration controls the structured exploration phase that proactively gathers
+        // context before the main LLM→Tools loop begins.
+        Exploration *ExplorationConfig `json:"exploration,omitempty" yaml:"exploration,omitempty"`
+        // Verification controls the post-edit verification phase that runs build/test
+        // commands after edits and injects failures as steering.
+        Verification *VerificationConfig `json:"verification,omitempty" yaml:"verification,omitempty"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
