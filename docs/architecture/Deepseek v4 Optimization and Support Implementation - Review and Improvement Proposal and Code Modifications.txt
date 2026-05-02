@@ -1,0 +1,534 @@
+# Deepseek v4 Optimization and Support Implementation - Review and Improvement Proposal
+
+I've reviewed the codebase's DeepSeek V4 customizations against the architecture plan (`docs/architecture/deepseek-v4-optimization-plan.md`). The implementation is ambitious and touches many parts of the pipeline. Here's my analysis, key improvement areas, and potential pitfalls.
+
+---
+
+## What's Been Implemented
+
+The following plan workstreams are partially or fully reflected in the existing code:
+
+| Workstream | Implementation Status |
+|------------|----------------------|
+| **1.1 DeepSeek V4 Provider Profile** | Model detection, context window auto-set, thinking parameters, reasoning content handling, `user_id` API field are present in `pipeline_llm.go` and `context.go`. |
+| **1.2 Adaptive Context Window** | `ContextWindow` is resolved from `ModelConfig` with model‑defaults fallback in `AgentInstance`; warning for suspiciously small windows. |
+| **2.1 Cache‑Aware Prompt Construction** | Stable system prompt ordering, `CacheBoundaryIndex`, `PrefixHash`, and ephemeral cache controls are computed in `BuildMessagesFromPrompt`. |
+| **2.2 Adaptive Compression Strategy** | `CompressionStrategy` ("eager", "adaptive", "conservative") is wired into summarization thresholds; `FullContextMode` disables non‑emergency compression. |
+| **3.1 Reasoning Mode Switching** | `resolveThinkingLevelForIteration` detects post‑tool, steering‑resume, and retry calls to toggle thinking on/off dynamically. |
+| **3.2 Streaming Integration** | `shouldUseStreaming` and `callWithStreaming` in `pipeline_llm.go` enable streaming when the provider supports it and the config allows. |
+| **3.3 Context Window Partitioning** | `ContextPartitionConfig` with budget percentages; `ComputePartitionBudgets` and `isOverPartitionBudget` added. |
+| **4.1 Full‑Context Codebase Loading** | `context_inject`, `context_list`, `context_clear` tools are registered; `InjectedContextStore` manages injected content with token budgets. |
+| **4.2 Cost‑Aware Model Routing** | Model routing via `routing.Router` with complexity scoring (`classifier.go`); cost tracking via `SessionCostTracker` and `/cost` command. |
+| **4.3 Enhanced Token Usage** | `UpdateUsageFromAPI` updates `ContextUsage` from provider `usage` data; cache hit/miss, reasoning, output token breakdown added. |
+| **5.1 DSML Tool‑Call Parser** | A `dsml_parser.go` module is referenced in the architecture docs, but its content is not visible in the provided snippets (likely present in the full source). |
+| **5.2 Chat Prefix Completion** | `prefix_completion` and `reasoning_prefix` options are set in LLM options and beta endpoint detection mentioned. |
+| **5.3 Strict Mode for Tool Calls** | `strict_tool_calls` option is passed in LLM options; schema validation helper probably exists but not fully shown. |
+| **5.4 JSON Output Mode** | `response_format` option is set; `ensureJSONInstructions` and `validateJSONResponse` are called in `CallLLM`. |
+
+---
+
+## Key Improvement Areas & Fix Proposals
+
+### 1. Interleaved Thinking – Reasoning Content Handling Might Not Be Fully Aligned with V4
+
+**Plan requirement**:  
+When tools are present, V4 preserves **all** reasoning content across **all** turns, including across user message boundaries. When no tools are present, the default behaviour drops reasoning from earlier turns (except the latest).
+
+**Current code** (inferred from context and provider adapter logic):  
+The code still contains a `filterDeepSeekReasoningMessages()` function (likely in `provider.go`). The V4‑specific logic should differentiate based on whether the system message contains tool definitions for that conversation. The plan specifies that when tools are present, we must **not strip** `reasoning_content` from any turn, and we should preserve the full interleaved thinking chain.
+
+**Proposal**:  
+- In `BuildMessagesFromPrompt`, explicitly track whether tool definitions will be sent to the model (i.e., the conversation has tools).  
+- Pass a flag to the provider adapter to indicate that the message list must retain all reasoning content.  
+- Remove or conditionally disable the old `filterDeepSeekReasoningMessages` for V4 when tools are active.  
+- Add a test that simulates a multi‑turn tool‑using conversation and verifies reasoning is preserved.
+
+---
+
+### 2. Cache‑Aware Prompt Construction – Prefix Hash Checkpoint Is Not Persisted Across Calls
+
+The plan expects that when the stable prefix changes (cache break), PicoClaw logs it and tracks the new hash. The code in `BuildMessagesFromPrompt` computes `prefixHash` and logs a break if `lastPrefixHash` changed, but `lastPrefixHash` is stored on the `ContextBuilder` which is **per‑agent, per‑request** — it is not persisted across agent restarts.
+
+**Issue**:  
+The prefix hash cache diagnostic is ephemeral; after a restart, the first call will not log a break even if the workspace content changed because `lastPrefixHash` resets to 0.
+
+**Proposal**:  
+Store the last known prefix hash in a durable session metadata or a small persistent file alongside the context builder, so that cross‑restart cache behaviour can be diagnosed and recorded. For now, this is low priority, but for production monitoring of caching efficiency it would be useful.
+
+---
+
+### 3. Adaptive Compression – Summarization Trigger May Still Fire Too Early for 1M‑token Models
+
+The plan’s `maybeSummarize` uses the legacy message‑count and token‑percent thresholds even after the refactoring. Although the `compressionStrategy` scales thresholds for `adaptive` and `conservative`, the per‑message token estimate is still based on the `chars * 2 / 5` heuristic, which is inaccurate for DeepSeek’s tokenizer (the plan itself notes a 20‑40% error rate).
+
+**Improvement**:  
+- For V4 models, always prefer API‑reported usage (from streaming `include_usage` or response `usage` block) to measure real token consumption.  
+- Use the actual token count reported in `exec.response.Usage` to determine whether to summarise, rather than relying solely on the heuristic. This can be done after the LLM call, adjusting the next turn’s thresholds.
+
+---
+
+### 4. Dynamic Thinking Mode – Only Coarse‑Grained Control
+
+The current implementation switches thinking **off** after a tool execution and **on** for fresh or steering‑resumed iterations. This is a good start, but the plan mentions more nuanced strategies, e.g., switching to `think‑max` for complex reasoning tasks and `think‑high` for general tasks.
+
+**Proposal**:  
+Enhance `resolveThinkingLevelForIteration` with a complexity score (reuse the model router’s complexity features) to decide whether to use `think‑high` or `think‑max` instead of always reverting to the configured level. This would give a three‑tier dynamic thinking: non‑think (post‑tool), think‑high (normal), think‑max (high‑complexity initial reasoning).
+
+---
+
+### 5. Streaming Integration – Error Handling on Prefix Completion Edge Cases
+
+The streaming path in `callWithStreaming` does not seem to handle the case where the provider streams but the connection is interrupted before the final `include_usage` chunk. In such cases, the usage data might be absent, and subsequent context budget calculations would fall back to the heuristic, which may be inaccurate.
+
+**Improvement**:  
+- Ensure that if streaming fails after some chunks, the partial response is still usable and that a fallback usage estimate is logged.  
+- If the `onChunk` callback accumulates enough text, consider using it for the final response when the stream is broken but sufficient content was received.
+
+---
+
+### 6. DSML Tool‑Call Parser – Missing Integration Points
+
+The plan expects a `dsml_parser.go` that can parse `<|DSML|tool_calls>…` markup from local model outputs. The code snippets do not show its full integration; the `openai_compat` provider should check if the response text contains DSML when `tool_calls` array is empty. Without this, local DeepSeek V4 models using the raw API (e.g., vLLM) would fail to execute tools.
+
+**Proposal**:  
+- Ensure `provider.go`’s response handling looks for DSML markers and calls `ParseDSMLToolCalls`.  
+- Add integration tests with a mock that returns DSML‑formatted text and verifies tool calls are extracted.
+
+---
+
+### 7. Strict Mode for Tool Calls – Schema Validation Before Sending
+
+The plan mentions a schema validation helper that checks function definitions for strict‑mode compliance before sending them to DeepSeek. I can’t see this validation in the provided code (though it may exist in a separate file). If it’s missing, sending non‑compliant schemas will result in 400 errors.
+
+**Improvement**:  
+- Implement a validator that scans all registered tool schemas and ensures every object has `additionalProperties: false` and all properties are in `required`.  
+- If the validator fails, either skip strict mode for that request or log a warning and remove the offending tool from the request (which might be worse).  
+- Consider a `strict_tool_calls_strict_schema` option that forces schema compliance and rejects startup if any tools cannot be made strict.
+
+---
+
+### 8. JSON Output Mode – May Cause Issues When Used Without `response_format`
+
+The code sets `response_format` in `llmOpts` and calls `ensureJSONInstructions`, but the DeepSeek API requires that `response_format` is sent as a top‑level parameter, not inside `llmOpts`? Actually, the DeepSeek V4 API uses `response_format` at the root level of the request body (like OpenAI). The `llmOpts` map is presumably passed to the provider, and the provider should extract it. I assume the provider adapter handles this correctly. However, if the provider is not DeepSeek, the `response_format` might be ignored.
+
+**Potential issue**: The JSON instructions are appended to the system message only if not already present; but they might need to be in the **user** message for DeepSeek (the API docs state that when `response_format` is `json_object`, a system or user message must explicitly mention JSON format). The code currently appends the instruction to the system message. That should work.
+
+---
+
+### 9. Context Partitioning – No Enforcement on I/O of Partition Budgets
+
+`isOverPartitionBudget` is defined but I don’t see it called in the proactive budget check before LLM call (`isOverContextBudget` in `pipeline_setup.go` still uses the flat check). The partition‑based overflow detection is not yet integrated into the turn lifecycle.
+
+**Proposal**:  
+- Replace or augment `isOverContextBudget` in `SetupTurn` with `isOverPartitionBudget` when a partition config is active.  
+- If the history partition overflows, trigger targeted compression of the oldest turns rather than the generic 50% drop.  
+- If the injected context partition overflows, truncate the injected items before building messages.
+
+---
+
+### 10. Token Estimator Still Heuristic – Cache Efficiency Could Be Better with Real Tokenizer
+
+The plan acknowledges that DeepSeek’s tokenizer differs and the heuristic can cause mis‑estimation. While the proactive + reactive design mitigates most problems, using the API’s reported usage for future turns would improve accuracy. The `SessionCostTracker` already records usage, but that data is not fed back into the context budget for the same session’s subsequent turns.
+
+**Suggestion**:  
+- Maintain a rolling estimate of tokens‑per‑character per model in a session, and use that weighted average for future `EstimateMessageTokens` calls when API usage data isn’t available yet.
+
+---
+
+## Overall Assessment
+
+The modifications align well with the DeepSeek V4 optimization plan, covering caching, thinking control, streaming, context partitioning, and cost tracking. The codebase is structured enough that many features are pluggable and testable.
+
+**Key Risks**:
+- The interleaved thinking (reasoning content) handling may not fully support V4’s tool‑call mode as documented, potentially breaking tool‑chain continuity.  
+- The partition‑based compression is not yet wired into the actual turn checklist; the proactive check still uses the flat budget.  
+- The DSML parser integration is absent in the visible code, possibly limiting local deployments.  
+- Strict mode missing schema validation could cause silent failures.
+
+I recommend prioritising the **interleaved thinking fix** and **partition enforcement** before production, as those directly impact conversation quality and context management efficiency.
+
+If you’d like me to dive deeper into any particular workstream or propose exact code changes, let me know.
+
+----
+
+# Deepseek v4 Support Implementation - Proposed Code Modifications
+
+I'll provide exact code modifications for the most impactful improvements, focusing on the integration points that are missing or incomplete.
+
+---
+
+## 1. Interleaved Thinking – Preserve Reasoning When Tools Are Present
+
+**Current issue**: The `filterDeepSeekReasoningMessages()` (in `pkg/providers/openai_compat/provider.go`) strips `reasoning_content` from earlier turns even when tools are defined, which breaks V4’s interleaved thinking.
+
+**Solution**: Add a flag on the provider request that indicates whether tools are being sent, and conditionally skip reasoning stripping for V4.
+
+### File: `pkg/providers/openai_compat/provider.go`
+
+Add a new option key and modify the request preparation:
+
+```go
+// In the ChatStream / Chat method, before processing messages
+
+// Check if tools are present (V4 interleaved thinking rule)
+toolsPresent := len(toolDefs) > 0
+
+// Pass a flag to the filter
+filteredMessages := messages
+if !toolsPresent {
+    // Only strip reasoning when no tools are present
+    filteredMessages = filterDeepSeekReasoningMessages(messages)
+}
+// ... use filteredMessages in the API request
+```
+
+Modify `filterDeepSeekReasoningMessages` to accept the flag (or add a separate function). Alternatively, simply move the filtering logic inline:
+
+```go
+// Replace the call:
+// filtered := filterDeepSeekReasoningMessages(messages)
+// With:
+filtered := messages
+if modelV4 && !toolsPresent {
+    filtered = stripReasoningFromHistory(messages)
+}
+// and implement stripReasoningFromHistory accordingly.
+```
+
+Exactly where the filtering happens: In the `Chat` and `ChatStream` methods, before the messages are sent to the OpenAI-compatible endpoint. Find the code that calls `filterDeepSeekReasoningMessages` and replace with the conditional logic.
+
+### File: `pkg/providers/openai_compat/provider.go` (exact location)
+
+Search for `filterDeepSeekReasoningMessages` and wrap it:
+
+```go
+// Before:
+// messages = filterDeepSeekReasoningMessages(messages)
+
+// After:
+if !toolsPresent {
+    messages = filterDeepSeekReasoningMessages(messages)
+}
+```
+
+Also, add a comment explaining why.
+
+---
+
+## 2. Context Partitioning – Integrate into Proactive Budget Check
+
+**Current issue**: `isOverPartitionBudget` is defined but never called; `SetupTurn` still uses the flat `isOverContextBudget`.
+
+**Solution**: In `pipeline_setup.go`, when a partition config is active, use the partition-based check instead.
+
+### File: `pkg/agent/pipeline_setup.go`, in `SetupTurn` method
+
+Find the code block:
+
+```go
+if !ts.opts.NoHistory {
+    toolDefs := ts.agent.Tools.ToProviderDefs()
+    if isOverContextBudget(ts.agent.ContextWindow, messages, toolDefs, ts.agent.MaxTokens) {
+        logger.WarnCF("agent", "Proactive compression...", ...)
+        // ... trigger compression
+    }
+}
+```
+
+Replace with:
+
+```go
+if !ts.opts.NoHistory {
+    toolDefs := ts.agent.Tools.ToProviderDefs()
+    var needCompress bool
+    if ts.agent.ContextPartition != nil {
+        // Compute system prompt tokens estimate
+        historyTokens := 0
+        for _, m := range messages {
+            historyTokens += EstimateMessageTokens(m)
+        }
+        systemEstimate := ts.agent.ContextBuilder.EstimateSystemTokens(
+            ts.agent.Sessions.GetSummary(ts.sessionKey),
+            nil,
+        )
+        toolTokens := EstimateToolDefsTokens(toolDefs)
+        injectedTokens := 0
+        if ts.agent.InjectedContext != nil {
+            injectedTokens = ts.agent.InjectedContext.TotalTokens()
+        }
+        // Use partition check; if history overflowing, compress
+        overflow, reason := isOverPartitionBudget(
+            ts.agent.ContextPartition,
+            ts.agent.ContextWindow,
+            historyTokens,
+            systemEstimate,
+            injectedTokens,
+            toolTokens,
+            ts.agent.MaxTokens,
+        )
+        if overflow {
+            needCompress = true
+            logger.WarnCF("agent", "Proactive compression: partition overflow",
+                map[string]any{"partition": reason, "session_key": ts.sessionKey})
+        }
+    } else {
+        needCompress = isOverContextBudget(ts.agent.ContextWindow, messages, toolDefs, ts.agent.MaxTokens)
+    }
+
+    if needCompress {
+        // ... existing compression logic remains unchanged
+    }
+}
+```
+
+### File: `pkg/agent/context_partition.go`
+
+Add a helper function to compute the system token estimate using the same logic as `computeContextUsage`. This already exists in `context_usage.go`; reuse it.
+
+---
+
+## 3. Dynamic Thinking Mode – Complexity-Based Level
+
+**Current issue**: `resolveThinkingLevelForIteration` only toggles thinking off/on; it could use a complexity score to choose between `think-high` and `think-max`.
+
+**Solution**: Enhance the function to accept a complexity score and adjust the level accordingly.
+
+### File: `pkg/agent/thinking.go`
+
+Modify `resolveThinkingLevelForIteration` signature and logic:
+
+```go
+func resolveThinkingLevelForIteration(
+    configuredLevel ThinkingLevel,
+    dynamicMode DynamicThinkingMode,
+    iteration int,
+    postToolCall bool,
+    steeringResumed bool,
+    isRetry bool,
+    complexityScore float64,   // new parameter
+) (ThinkingLevel, string) {
+    if dynamicMode == DynamicThinkingFixed || configuredLevel == ThinkingOff {
+        return configuredLevel, "configured"
+    }
+
+    if iteration == 1 || isRetry || steeringResumed {
+        // For complex initial/steering/retry turns, use higher thinking if available
+        if configuredLevel == ThinkingHigh && complexityScore > 0.7 {
+            return ThinkingXHigh, "complexity_boost"
+        }
+        return configuredLevel, "initial"
+    }
+
+    if postToolCall {
+        return ThinkingOff, "post_tool"
+    }
+
+    return configuredLevel, "configured"
+}
+```
+
+### File: `pkg/agent/pipeline_llm.go`
+
+In `CallLLM`, before calling `resolveThinkingLevelForIteration`, compute a complexity score:
+
+```go
+// Near the top of CallLLM, after setting up exec
+complexity := 0.0
+if ts.agent.Router != nil {
+    _, _, score := ts.agent.Router.SelectModel(ts.userMessage, exec.history, ts.agent.Model)
+    complexity = score
+}
+
+// ... later, when calling resolveThinkingLevelForIteration:
+effectiveLevel, reason := resolveThinkingLevelForIteration(
+    ts.agent.ThinkingLevel,
+    dynamicMode,
+    iteration,
+    exec.postToolCall,
+    steeringResumed,
+    exec.isRetry,
+    complexity,  // pass complexity
+)
+```
+
+---
+
+## 4. Strict Mode – Schema Validation Before Sending
+
+**Current issue**: The plan calls for validating tool schemas for strict-mode compliance; this is missing from the visible code.
+
+**Solution**: Add a schema validator and either skip strict mode or drop non-compliant tools.
+
+### File: `pkg/providers/openai_compat/schema_validator.go` (new file)
+
+Create a simple validator:
+
+```go
+package openai_compat
+
+import (
+    "fmt"
+    "github.com/sipeed/picoclaw/pkg/providers"
+)
+
+func ValidateStrictToolSchemas(tools []providers.ToolDefinition) ([]providers.ToolDefinition, error) {
+    var clean []providers.ToolDefinition
+    for _, t := range tools {
+        if t.Function.Parameters == nil {
+            continue
+        }
+        schema, ok := t.Function.Parameters.(map[string]any)
+        if !ok {
+            continue
+        }
+        if err := enforceStrictSchema(schema, ""); err != nil {
+            return nil, fmt.Errorf("tool %q: %w", t.Function.Name, err)
+        }
+        clean = append(clean, t)
+    }
+    return clean, nil
+}
+
+func enforceStrictSchema(schema map[string]any, path string) error {
+    if t, _ := schema["type"].(string); t == "object" {
+        props, ok := schema["properties"].(map[string]any)
+        if ok && len(props) > 0 {
+            if _, has := schema["additionalProperties"]; !has {
+                schema["additionalProperties"] = false
+            } else if ap, ok := schema["additionalProperties"].(bool); ok && ap {
+                return fmt.Errorf("path %s: additionalProperties must be false for strict mode", path)
+            }
+            required, _ := schema["required"].([]any)
+            for name := range props {
+                if !containsAny(required, name) {
+                    // Log warning, but automatically add to required if missing
+                    // (automatic fix rather than error)
+                    schema["required"] = append(required, name)
+                }
+            }
+        }
+        for k, v := range props {
+            if sub, ok := v.(map[string]any); ok {
+                if err := enforceStrictSchema(sub, path+"."+k); err != nil {
+                    return err
+                }
+            }
+        }
+    }
+    return nil
+}
+```
+
+### File: `pkg/agent/pipeline_llm.go`
+
+In `CallLLM`, before building the request, when `ts.agent.StrictToolCalls` is true, validate:
+
+```go
+if ts.agent.StrictToolCalls {
+    validated, err := openai_compat.ValidateStrictToolSchemas(exec.providerToolDefs)
+    if err != nil {
+        logger.WarnCF("agent", "Strict mode: some tool schemas invalid, disabling strict mode",
+            map[string]any{"error": err.Error()})
+        exec.llmOpts["strict_tool_calls"] = false
+    } else {
+        exec.providerToolDefs = validated
+    }
+}
+```
+
+---
+
+## 5. Streaming Error Handling – Graceful Fallback
+
+**Current issue**: If streaming fails after partial chunks, the response is lost and the error propagates.
+
+**Solution**: In `callWithStreaming`, accumulate partial content and return a best-effort response on error, with usage estimation.
+
+### File: `pkg/agent/pipeline_llm.go`, in `callWithStreaming`
+
+Modify the function to capture accumulated content and fall back to it if the stream fails:
+
+```go
+var accumulatedText string
+onChunk := func(text string) {
+    accumulatedText = text
+    // ... event emission as before
+}
+
+resp, err := sp.ChatStream(ctx, messages, tools, model, opts, onChunk)
+if err != nil {
+    if accumulatedText != "" {
+        // Return partial response as a fallback
+        logger.WarnCF("agent", "Stream failed, returning partial response",
+            map[string]any{"error": err.Error(), "partial_len": len(accumulatedText)})
+        return &providers.LLMResponse{
+            Content:      accumulatedText,
+            FinishReason: "interrupted",
+            Usage: &providers.UsageInfo{
+                // Heuristic estimate for partial stream
+                PromptTokens: EstimateMessageTokens(combinedMsg),
+                CompletionTokens: tokenizer.EstimateMessageTokens(providers.Message{Content: accumulatedText}),
+            },
+        }, nil
+    }
+    return nil, err
+}
+```
+
+This requires a `combinedMsg` for context; you can compute it from the messages slice.
+
+---
+
+## 6. DSML Parser Integration
+
+**Current issue**: DSML parsing is only mentioned in the plan; integration point missing.
+
+**Solution**: In `provider.go`, after receiving a response with no tool calls, try parsing DSML from the content.
+
+### File: `pkg/providers/openai_compat/provider.go`
+
+After decoding the response, add this fallback:
+
+```go
+if len(response.ToolCalls) == 0 && strings.Contains(respText, "<|DSML|tool_calls>") {
+    tools, err := ParseDSMLToolCalls(respText)
+    if err != nil {
+        logger.Warn("dsml", "Failed to parse DSML tool calls", map[string]any{"error": err.Error()})
+    } else {
+        response.ToolCalls = tools
+    }
+}
+```
+
+Make sure the `dsml_parser.go` file actually exists and exports `ParseDSMLToolCalls` function returning `[]ToolCall, error`.
+
+---
+
+## 7. Token Estimator Feedback Loop
+
+**Potential improvement**: Use API-reported usage to refine the token estimator per model.
+
+### File: `pkg/agent/pipeline_llm.go`, after successful LLM call
+
+```go
+if exec.response.Usage != nil {
+    // Update model-specific token ratio for future estimates
+    totalInputChars := 0
+    for _, m := range exec.callMessages {
+        totalInputChars += len(m.Content)
+    }
+    if totalInputChars > 0 && exec.response.Usage.PromptTokens > 0 {
+        ratio := float64(exec.response.Usage.PromptTokens) / float64(totalInputChars)
+        // Store per-model ratio in a global map (thread-safe)
+        tokenRatesMu.Lock()
+        tokenRates[exec.llmModel] = (tokenRates[exec.llmModel] + ratio) / 2 // EMA
+        tokenRatesMu.Unlock()
+    }
+}
+```
+
+And in `tokenizer.EstimateMessageTokens`, if a per-model ratio is available, use it instead of the generic `chars * 2 / 5`.
+
+---
+
+These code changes address the gaps between the architecture plan and the current implementation, focusing on reasoning handling, partition enforcement, dynamic thinking, strict mode, streaming resilience, DSML integration, and token estimation. Each change is minimal and targeted, with no breaking alterations to existing provider integrations.
