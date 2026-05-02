@@ -50,6 +50,11 @@ type AgentInstance struct {
         SkillsFilter              []string
         Candidates                []providers.FallbackCandidate
 
+        // InjectedContext holds the session's injected/retrieved context store.
+        // Populated during agent initialization and wired into the ContextBuilder
+        // and context_inject/context_list/context_clear tools.
+        InjectedContext *InjectedContextStore
+
         // Router is non-nil when model routing is configured and the light model
         // was successfully resolved. It scores each incoming message and decides
         // whether to route to LightCandidates or stay with Candidates.
@@ -64,6 +69,10 @@ type AgentInstance struct {
         // instances. This allows each fallback model to use its own api_base and api_key
         // from model_list, instead of inheriting the primary model's provider config.
         CandidateProviders map[string]providers.LLMProvider
+
+        // CostTracker tracks per-session cost for /cost reporting. Initialized in
+        // NewAgentInstance and updated after each LLM response (WS 4.3).
+        CostTracker *SessionCostTracker
 }
 
 // NewAgentInstance creates an agent instance from config.
@@ -126,16 +135,23 @@ func NewAgentInstance(
                 toolsRegistry.Register(tools.NewAppendFileTool(workspace, restrict, allowWritePaths))
         }
 
+        // Register context injection tools (context_inject, context_list, context_clear)
+        toolsRegistry.Register(tools.NewContextInjectTool())
+        toolsRegistry.Register(tools.NewContextListTool())
+        toolsRegistry.Register(tools.NewContextClearTool())
+
         sessionsDir := filepath.Join(workspace, "sessions")
         sessions := initSessionStore(sessionsDir)
 
         mcpDiscoveryActive := cfg.Tools.MCP.Enabled && cfg.Tools.MCP.Discovery.Enabled
+        injectedContextStore := NewInjectedContextStore()
         contextBuilder := NewContextBuilder(workspace).
                 WithToolDiscovery(
                         mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseBM25,
                         mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseRegex,
                 ).
                 WithSplitOnMarker(cfg.Agents.Defaults.SplitOnMarker)
+        contextBuilder.InjectedContext = injectedContextStore
 
         agentID := routing.DefaultAgentID
         agentName := ""
@@ -337,10 +353,12 @@ func NewAgentInstance(
                 Subagents:                 subagents,
                 SkillsFilter:              skillsFilter,
                 Candidates:                candidates,
+                InjectedContext:           injectedContextStore,
                 Router:                    router,
                 LightCandidates:           lightCandidates,
                 LightProvider:             lightProvider,
                 CandidateProviders:        candidateProviders,
+                CostTracker:               NewSessionCostTracker(),
         }
 }
 

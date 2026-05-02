@@ -5,18 +5,19 @@ package commands
 // Definitions are stateless — runtime dependencies are provided
 // via the Runtime parameter passed to handlers at execution time.
 func BuiltinDefinitions() []Definition {
-	return []Definition{
-		startCommand(),
-		helpCommand(),
-		showCommand(),
-		listCommand(),
-		useCommand(),
-		btwCommand(),
-		switchCommand(),
-		checkCommand(),
-		clearCommand(),
-		contextCommand(),
-		subagentsCommand(),
-		reloadCommand(),
-	}
+        return []Definition{
+                startCommand(),
+                helpCommand(),
+                showCommand(),
+                listCommand(),
+                useCommand(),
+                btwCommand(),
+                switchCommand(),
+                checkCommand(),
+                clearCommand(),
+                contextCommand(),
+                costCommand(),
+                subagentsCommand(),
+                reloadCommand(),
+        }
 }

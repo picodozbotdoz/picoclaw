@@ -86,8 +86,10 @@ func computeContextUsage(agent *AgentInstance, sessionKey string) *bus.ContextUs
                 usage.SystemPromptTokens = systemTokens
                 usage.HistoryTokens = historyTokens
                 usage.ToolDefTokens = toolTokens
-                // InjectedContextTokens is populated dynamically when content is
-                // injected into the retrieved context partition (Phase 4, WS 4.1).
+                // WS 4.1: Populate InjectedContextTokens from the store's TotalTokens().
+                if agent.InjectedContext != nil {
+                        usage.InjectedContextTokens = agent.InjectedContext.TotalTokens()
+                }
         }
 
         return usage

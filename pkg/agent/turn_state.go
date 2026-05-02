@@ -234,6 +234,10 @@ type turnState struct {
         lastFinishReason string               // Last LLM finish_reason
         lastUsage        *providers.UsageInfo // Last LLM usage info
 
+        // WS 4.3: Context usage tracking — stores the most recent ContextUsage
+        // snapshot updated from API-reported usage data after each LLM response.
+        contextUsage *bus.ContextUsage
+
         // Back-reference to the owning AgentLoop (set for SubTurns only, used for hard abort cascade)
         al *AgentLoop
 }
@@ -627,6 +631,20 @@ func (ts *turnState) SetLastUsage(usage *providers.UsageInfo) {
         ts.mu.Lock()
         defer ts.mu.Unlock()
         ts.lastUsage = usage
+}
+
+// WS 4.3: setContextUsage stores the current ContextUsage snapshot on the turn state.
+func (ts *turnState) setContextUsage(u *bus.ContextUsage) {
+        ts.mu.Lock()
+        defer ts.mu.Unlock()
+        ts.contextUsage = u
+}
+
+// getContextUsage returns the current ContextUsage snapshot from the turn state.
+func (ts *turnState) getContextUsage() *bus.ContextUsage {
+        ts.mu.RLock()
+        defer ts.mu.RUnlock()
+        return ts.contextUsage
 }
 
 // =============================================================================

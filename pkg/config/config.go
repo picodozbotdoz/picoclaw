@@ -235,6 +235,13 @@ type RoutingConfig struct {
         Enabled    bool    `json:"enabled"`
         LightModel string  `json:"light_model"` // model_name from model_list to use for simple tasks
         Threshold  float64 `json:"threshold"`   // complexity score in [0,1]; score >= threshold → primary model
+        // CostBudget is the maximum estimated spend per session in USD.
+        // When approaching this budget, the router downgrades from Pro to Flash.
+        // Set to 0 (default) to disable cost-based routing.
+        CostBudget float64 `json:"cost_budget,omitempty"`
+        // BudgetThreshold is the percentage (0-1) of the budget at which
+        // cost-based downgrading kicks in. Default: 0.8 (80%).
+        BudgetThreshold float64 `json:"budget_threshold,omitempty"`
 }
 
 // SubTurnConfig configures the SubTurn execution system.

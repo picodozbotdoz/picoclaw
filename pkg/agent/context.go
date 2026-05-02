@@ -29,6 +29,11 @@ type ContextBuilder struct {
         splitOnMarker  bool
         promptRegistry *PromptRegistry
 
+        // InjectedContext is the store for injected/retrieved context items.
+        // Set via SetInjectedContextStore. When non-nil, its Content() is
+        // included in the system prompt as a stable, cacheable part.
+        InjectedContext *InjectedContextStore
+
         // Cache for system prompt to avoid rebuilding on every call.
         // This fixes issue #607: repeated reprocessing of the entire context.
         // The cache auto-invalidates when workspace source files change (mtime check).
@@ -242,6 +247,23 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
                         Stable:  true,
                         Cache:   PromptCacheEphemeral,
                 })
+        }
+
+        // Injected/Retrieved context (from context_inject tool)
+        if cb.InjectedContext != nil {
+                injectedContent := cb.InjectedContext.Content()
+                if injectedContent != "" {
+                        add(PromptPart{
+                                ID:      "context.retrieved",
+                                Layer:   PromptLayerContext,
+                                Slot:    PromptSlotRetrievedContext,
+                                Source:  PromptSource{ID: PromptSourceRetrievedContext, Name: "injected_context"},
+                                Title:   "injected context",
+                                Content: "# Injected Context\n\n" + injectedContent,
+                                Stable:  true,
+                                Cache:   PromptCacheEphemeral,
+                        })
+                }
         }
 
         // Multi-Message Sending (if enabled)

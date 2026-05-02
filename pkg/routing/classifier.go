@@ -8,7 +8,7 @@ package routing
 // Classifier is an interface so that future implementations (ML-based, embedding-based,
 // or any other approach) can be swapped in without changing routing infrastructure.
 type Classifier interface {
-	Score(f Features) float64
+        Score(f Features) float64
 }
 
 // RuleClassifier is the v1 implementation.
@@ -18,13 +18,13 @@ type Classifier interface {
 //
 // Individual weights (multiple signals can fire simultaneously):
 //
-//	token > 200 (≈600 chars): 0.35  — very long prompts are almost always complex
-//	token 50-200:             0.15  — medium length; may or may not be complex
-//	code block present:       0.40  — coding tasks need the heavy model
-//	tool calls > 3 (recent):  0.25  — dense tool usage signals an agentic workflow
-//	tool calls 1-3 (recent):  0.10  — some tool activity
-//	conversation depth > 10:  0.10  — long sessions carry implicit complexity
-//	attachments present:      1.00  — hard gate; multi-modal always needs heavy model
+//      token > 200 (≈600 chars): 0.35  — very long prompts are almost always complex
+//      token 50-200:             0.15  — medium length; may or may not be complex
+//      code block present:       0.40  — coding tasks need the heavy model
+//      tool calls > 3 (recent):  0.25  — dense tool usage signals an agentic workflow
+//      tool calls 1-3 (recent):  0.10  — some tool activity
+//      conversation depth > 10:  0.10  — long sessions carry implicit complexity
+//      attachments present:      1.00  — hard gate; multi-modal always needs heavy model
 //
 // Default threshold is 0.35, so:
 //   - Pure greetings / trivial Q&A:                 0.00 → light  ✓
@@ -38,43 +38,79 @@ type RuleClassifier struct{}
 // Score computes the complexity score for the given feature set.
 // The returned value is in [0, 1]. Attachments short-circuit to 1.0.
 func (c *RuleClassifier) Score(f Features) float64 {
-	// Hard gate: multi-modal inputs always require the heavy model.
-	if f.HasAttachments {
-		return 1.0
-	}
+        // Hard gate: multi-modal inputs always require the heavy model.
+        if f.HasAttachments {
+                return 1.0
+        }
 
-	var score float64
+        var score float64
 
-	// Token estimate — primary verbosity signal
-	switch {
-	case f.TokenEstimate > 200:
-		score += 0.35
-	case f.TokenEstimate > 50:
-		score += 0.15
-	}
+        // Token estimate — primary verbosity signal
+        switch {
+        case f.TokenEstimate > 200:
+                score += 0.35
+        case f.TokenEstimate > 50:
+                score += 0.15
+        }
 
-	// Fenced code blocks — strongest indicator of a coding/technical task
-	if f.CodeBlockCount > 0 {
-		score += 0.40
-	}
+        // Fenced code blocks — strongest indicator of a coding/technical task
+        if f.CodeBlockCount > 0 {
+                score += 0.40
+        }
 
-	// Recent tool call density — indicates an ongoing agentic workflow
-	switch {
-	case f.RecentToolCalls > 3:
-		score += 0.25
-	case f.RecentToolCalls > 0:
-		score += 0.10
-	}
+        // Recent tool call density — indicates an ongoing agentic workflow
+        switch {
+        case f.RecentToolCalls > 3:
+                score += 0.25
+        case f.RecentToolCalls > 0:
+                score += 0.10
+        }
 
-	// Conversation depth — accumulated context implies compound task
-	if f.ConversationDepth > 10 {
-		score += 0.10
-	}
+        // Conversation depth — accumulated context implies compound task
+        if f.ConversationDepth > 10 {
+                score += 0.10
+        }
 
-	// Cap at 1.0 to honor the [0, 1] contract even when multiple signals fire
-	// simultaneously (e.g., long message + code block + tool chain = 1.10 raw).
-	if score > 1.0 {
-		score = 1.0
-	}
-	return score
+                // Cap at 1.0 to honor the [0, 1] contract even when multiple signals fire
+        // simultaneously (e.g., long message + code block + tool chain = 1.10 raw).
+        if score > 1.0 {
+                score = 1.0
+        }
+        return score
+}
+
+// DeepSeekV4Classifier extends RuleClassifier with V4-specific signals.
+// It adds:
+//   - Injected context presence: +0.15 (large codebase context implies complex task)
+//   - Tool count available: > 10 tools → +0.10 (many tools = agentic workflow)
+type DeepSeekV4Classifier struct {
+        RuleClassifier
+        // InjectedContextTokens is the number of tokens in the injected/retrieved context.
+        // When non-zero, this signals a codebase-aware task that benefits from Pro.
+        InjectedContextTokens int
+        // ToolCount is the number of tools available to the agent.
+        // More than 10 tools suggests an agentic workflow that benefits from Pro.
+        ToolCount int
+}
+
+// Score computes the complexity score for the given feature set, adding
+// DeepSeek V4-specific signals on top of the base RuleClassifier scoring.
+func (c *DeepSeekV4Classifier) Score(f Features) float64 {
+        score := c.RuleClassifier.Score(f)
+
+        // Injected context presence: large codebase context implies complex task
+        if c.InjectedContextTokens > 0 {
+                score += 0.15
+        }
+
+        // Many available tools signals agentic workflow
+        if c.ToolCount > 10 {
+                score += 0.10
+        }
+
+        // Cap at 1.0 to honor the [0, 1] contract
+        if score > 1.0 {
+                score = 1.0
+        }
+        return score
 }

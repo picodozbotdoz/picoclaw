@@ -463,6 +463,20 @@ func (p *Pipeline) CallLLM(
         }
         logger.DebugCF("agent", "LLM response", llmResponseFields)
 
+        // WS 4.3: Propagate API usage data to ContextUsage for accurate tracking.
+        // This replaces heuristic estimates with actual counts from the provider.
+        if exec.response.Usage != nil {
+                usage := computeContextUsage(ts.agent, ts.sessionKey)
+                if usage != nil {
+                        UpdateUsageFromAPI(usage, exec.response.Usage)
+                        ts.setContextUsage(usage)
+                }
+                // Record usage in the session cost tracker for /cost reporting.
+                if ts.agent.CostTracker != nil {
+                        ts.agent.CostTracker.RecordLLMUsage(exec.llmModel, exec.response.Usage)
+                }
+        }
+
         // No-tool-call path: steering check and direct response
         if len(exec.response.ToolCalls) == 0 || exec.gracefulTerminal {
                 responseContent := exec.response.Content
