@@ -130,16 +130,14 @@ func (p *Pipeline) CallLLM(
                         invalidCount := 0
                         for _, td := range exec.providerToolDefs {
                                 if td.Function.Parameters != nil {
-                                        if schemaMap, ok := td.Function.Parameters.(map[string]any); ok {
-                                                if result := openai_compat.ValidateStrictSchema(schemaMap, td.Function.Name); !result.Valid {
-                                                        invalidCount++
-                                                        if len(result.Errors) > 0 {
-                                                                logger.WarnCF("agent", "Strict mode schema validation error",
-                                                                        map[string]any{
-                                                                                "function": td.Function.Name,
-                                                                                "errors":   strings.Join(result.Errors, "; "),
-                                                                        })
-                                                        }
+                                        if result := openai_compat.ValidateStrictSchema(td.Function.Parameters, td.Function.Name); !result.Valid {
+                                                invalidCount++
+                                                if len(result.Errors) > 0 {
+                                                        logger.WarnCF("agent", "Strict mode schema validation error",
+                                                                map[string]any{
+                                                                        "function": td.Function.Name,
+                                                                        "errors":   strings.Join(result.Errors, "; "),
+                                                                })
                                                 }
                                         }
                                 }

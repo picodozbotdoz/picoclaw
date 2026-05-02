@@ -141,7 +141,7 @@ INSERT INTO llm_calls (
     provider, model,
     request_time, messages_count, tools_count, max_tokens, temperature,
     thinking_mode, is_streaming, request_snippet
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 const sqlUpdateLLMCallResponse = `
