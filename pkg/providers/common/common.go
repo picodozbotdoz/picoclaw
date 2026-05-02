@@ -163,9 +163,13 @@ func serializeToolCalls(toolCalls []ToolCall) []openaiToolCall {
 
         out := make([]openaiToolCall, 0, len(toolCalls))
         for _, tc := range toolCalls {
+                toolType := tc.Type
+                if toolType == "" {
+                        toolType = "function" // OpenAI-compatible APIs require type:"function"
+                }
                 wireCall := openaiToolCall{
                         ID:   tc.ID,
-                        Type: tc.Type,
+                        Type: toolType,
                 }
 
                 if tc.Function != nil {
