@@ -243,6 +243,15 @@ func (s *Server) RegisterHandler(pattern string, handler http.HandlerFunc) {
         }
 }
 
+// HandleFunc registers a handler function on the health server's mux.
+// This satisfies the tracing.HandlerMux interface, allowing the health
+// server to be used as a mux for tracing HTTP endpoints.
+func (s *Server) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+        if s.mux != nil {
+                s.mux.HandleFunc(pattern, handler)
+        }
+}
+
 func statusString(ok bool) string {
         if ok {
                 return "ok"

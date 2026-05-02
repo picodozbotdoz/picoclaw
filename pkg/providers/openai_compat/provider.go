@@ -144,7 +144,7 @@ func (p *Provider) buildRequestBody(
 
         requestBody := map[string]any{
                 "model":    model,
-                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages, model, tools)),
+                "messages": common.SerializeMessages(p.prepareMessagesForRequest(messages, model, tools, options)),
         }
 
         // When fallback uses a different provider (e.g. DeepSeek), that provider must not inject web_search_preview.
@@ -272,7 +272,7 @@ func (p *Provider) SupportsThinking() bool {
         return p.isDeepSeekReasoningProvider()
 }
 
-func (p *Provider) prepareMessagesForRequest(messages []Message, model string, tools []ToolDefinition) []Message {
+func (p *Provider) prepareMessagesForRequest(messages []Message, model string, tools []ToolDefinition, options map[string]any) []Message {
         if len(messages) == 0 {
                 return nil
         }
@@ -289,21 +289,22 @@ func (p *Provider) prepareMessagesForRequest(messages []Message, model string, t
                 // - General conversational: reasoning from earlier turns discarded
                 //   (drop_thinking mode for token savings when no tools are involved)
                 //
-                // When tools are present in the request, we ALWAYS preserve all reasoning
-                // content to maintain the interleaved thinking chain. When no tools are
-                // present AND the drop_thinking option is enabled, we strip reasoning from
-                // earlier turns (keeping only the latest assistant turn's reasoning).
+                // By default, PicoClaw preserves ALL reasoning_content for V4 models
+                // regardless of tool presence, as this provides the best quality.
+                // The drop_thinking optimization is available via the "drop_thinking"
+                // option when token savings are needed and no tools are present.
                 if isDeepSeekV4ModelName(model) {
                         toolsPresent := len(tools) > 0 || hasToolInteractions(messages)
                         if toolsPresent {
                                 // V4 with tools: preserve ALL reasoning for interleaved thinking continuity.
-                                // This is critical — stripping reasoning in tool-calling scenarios breaks
-                                // the model's ability to maintain reasoning context across tool rounds.
                                 return filterDeepSeekV4ReasoningMessages(messages)
                         }
-                        // V4 without tools: use drop_thinking to save tokens by discarding
-                        // reasoning from earlier turns, keeping only the latest assistant reasoning.
-                        return filterDeepSeekV4ReasoningMessagesDropThinking(messages)
+                        // V4 without tools: check for drop_thinking option
+                        if dropThinking, _ := options["drop_thinking"].(bool); dropThinking {
+                                return filterDeepSeekV4ReasoningMessagesDropThinking(messages)
+                        }
+                        // Default: preserve all reasoning for best quality
+                        return filterDeepSeekV4ReasoningMessages(messages)
                 }
                 return filterDeepSeekReasoningMessages(messages)
         }
