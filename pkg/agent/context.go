@@ -75,6 +75,19 @@ func (cb *ContextBuilder) WithToolDiscovery(useBM25, useRegex bool) *ContextBuil
         return cb
 }
 
+// WithSafeEditWorkflow registers the safe-edit workflow prompt contributor,
+// which injects mandatory code editing rules into the system prompt.
+// These are "Level 1" prompt-based rules; the "Level 2" hook enforcement
+// is configured separately via the hooks.builtins.safe_edit config.
+func (cb *ContextBuilder) WithSafeEditWorkflow() *ContextBuilder {
+        if err := cb.RegisterPromptContributor(safeEditWorkflowContributor{}); err != nil {
+                logger.WarnCF("agent", "Failed to register safe-edit workflow prompt contributor", map[string]any{
+                        "error": err.Error(),
+                })
+        }
+        return cb
+}
+
 func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
         cb.splitOnMarker = enabled
         return cb
