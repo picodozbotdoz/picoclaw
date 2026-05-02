@@ -177,6 +177,13 @@ func builtinPromptSources() []PromptSourceDescriptor {
                         StableByDefault: true,
                 },
                 {
+                        ID:              PromptSourceSafeEditWorkflow,
+                        Owner:           "hooks",
+                        Description:     "Safe edit workflow rules — systematic exploration before code modification",
+                        Allowed:         []PromptPlacement{{Layer: PromptLayerCapability, Slot: PromptSlotTooling}},
+                        StableByDefault: true,
+                },
+                {
                         ID:              PromptSourceToolRegistry,
                         Owner:           "tools",
                         Description:     "Native provider tool definitions",
