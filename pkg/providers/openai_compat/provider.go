@@ -7,13 +7,13 @@ import (
         "encoding/json"
         "fmt"
         "io"
-        "log"
         "maps"
         "net/http"
         "net/url"
         "strings"
         "time"
 
+        "github.com/sipeed/picoclaw/pkg/logger"
         "github.com/sipeed/picoclaw/pkg/providers/common"
         "github.com/sipeed/picoclaw/pkg/providers/messageutil"
         "github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
@@ -528,7 +528,7 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
         if HasDSMLToolCalls(response.Content) {
                 toolCalls, remaining, err := ParseDSMLToolCalls(response.Content)
                 if err != nil {
-                        log.Printf("openai_compat: DSML parse warning: %v", err)
+                        logger.WarnCF("provider", "DSML parse warning", map[string]any{"error": err.Error()})
                 }
                 if len(toolCalls) > 0 {
                         response.ToolCalls = toolCalls
@@ -536,7 +536,7 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
                         if response.FinishReason == "stop" {
                                 response.FinishReason = "tool_calls"
                         }
-                        log.Printf("openai_compat: parsed %d tool calls from DSML format", len(toolCalls))
+                        logger.InfoCF("provider", "Parsed tool calls from DSML format", map[string]any{"count": len(toolCalls)})
                         return response
                 }
         }
@@ -547,7 +547,7 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
         if HasDSMLToolCalls(response.ReasoningContent) {
                 toolCalls, remaining, err := ParseDSMLToolCalls(response.ReasoningContent)
                 if err != nil {
-                        log.Printf("openai_compat: DSML parse warning (reasoning): %v", err)
+                        logger.WarnCF("provider", "DSML parse warning (reasoning)", map[string]any{"error": err.Error()})
                 }
                 if len(toolCalls) > 0 {
                         response.ToolCalls = toolCalls
@@ -555,7 +555,7 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
                         if response.FinishReason == "stop" {
                                 response.FinishReason = "tool_calls"
                         }
-                        log.Printf("openai_compat: parsed %d tool calls from DSML in reasoning_content", len(toolCalls))
+                        logger.InfoCF("provider", "Parsed tool calls from DSML in reasoning_content", map[string]any{"count": len(toolCalls)})
                 }
         }
 
@@ -757,7 +757,7 @@ func parseStreamResponse(
                 raw := acc.argsJSON.String()
                 if raw != "" {
                         if err := json.Unmarshal([]byte(raw), &args); err != nil {
-                                log.Printf("openai_compat stream: failed to decode tool call arguments for %q: %v", acc.name, err)
+                                logger.WarnCF("provider", "Failed to decode tool call arguments (stream)", map[string]any{"tool": acc.name, "error": err.Error()})
                                 args["raw"] = raw
                         }
                 }
@@ -830,8 +830,7 @@ func buildStrictToolsList(tools []ToolDefinition) []any {
                                 // Auto-sanitize the schema to fix common issues
                                 parameters = SanitizeSchemaForStrictMode(t.Function.Parameters)
                                 if len(validationResult.Errors) > 0 {
-                                        log.Printf("openai_compat: strict mode schema auto-fixed for function %q: %s",
-                                                t.Function.Name, FormatValidationResult(validationResult))
+                                        logger.WarnCF("provider", "Strict mode schema auto-fixed", map[string]any{"function": t.Function.Name, "result": FormatValidationResult(validationResult)})
                                 }
                         }
                 }
