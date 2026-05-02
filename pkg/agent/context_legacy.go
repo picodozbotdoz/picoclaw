@@ -39,7 +39,9 @@ func (m *legacyContextManager) Compact(_ context.Context, req *CompactRequest) e
         switch req.Reason {
         case ContextCompressReasonProactive, ContextCompressReasonRetry:
                 // Sync emergency compression — budget exceeded.
-                if result, ok := m.forceCompression(req.SessionKey); ok {
+                // When Partition is set (e.g., "history"), use targeted compression
+                // that drops only the oldest turns rather than the generic 50% cut.
+                if result, ok := m.forceCompression(req.SessionKey, req.Partition, req.Model); ok {
                         m.al.emitEvent(
                                 EventKindContextCompress,
                                 m.al.newTurnEventScope("", req.SessionKey, nil).meta(0, "forceCompression", "turn.context.compress"),
@@ -148,9 +150,12 @@ type compressionResult struct {
 }
 
 // forceCompression aggressively reduces context when the limit is hit.
-// It drops the oldest ~50% of Turns (a Turn is a complete user→LLM→response
-// cycle, as defined in #1316), so tool-call sequences are never split.
-func (m *legacyContextManager) forceCompression(sessionKey string) (compressionResult, bool) {
+// When partition is "history", it uses targeted compression: drops only the
+// oldest turns (one at a time) until the history partition fits within its
+// budget, preserving the most recent context. This is more efficient than the
+// generic 50% cut for partition-aware workflows like DeepSeek V4's 1M context.
+// When partition is empty or any other value, the original 50% cut is used.
+func (m *legacyContextManager) forceCompression(sessionKey string, partition string, model string) (compressionResult, bool) {
         agent := m.al.registry.GetDefaultAgent()
         if agent == nil {
                 return compressionResult{}, false
@@ -161,6 +166,16 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
                 return compressionResult{}, false
         }
 
+        // Targeted compression for history partition overflow:
+        // Instead of cutting 50% of turns, progressively drop the oldest
+        // turn until the history partition fits within its budget. This
+        // preserves more recent context and is especially important for
+        // V4 models with 1M context where a 50% cut is wasteful.
+        if partition == "partition overflow: history" && agent.ContextPartition != nil {
+                return m.targetedHistoryCompression(agent, sessionKey, model)
+        }
+
+        // Default: generic 50% cut at turn boundary
         turns := parseTurnBoundaries(history)
         var mid int
         if len(turns) >= 2 {
@@ -181,7 +196,95 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
         }
 
         droppedCount := len(history) - len(keptHistory)
+        m.applyCompression(agent, sessionKey, history, 0, droppedCount, keptHistory)
+        return compressionResult{
+                DroppedMessages:   droppedCount,
+                RemainingMessages: len(keptHistory),
+        }, true
+}
 
+// targetedHistoryCompression drops the oldest turns one at a time until
+// the history partition fits within its budget. This is more surgical than
+// the generic 50% cut: it preserves the maximum amount of recent context
+// while still resolving the overflow. Uses model-aware estimation when
+// the model is available.
+func (m *legacyContextManager) targetedHistoryCompression(agent *AgentInstance, sessionKey string, model string) (compressionResult, bool) {
+        history := agent.Sessions.GetHistory(sessionKey)
+        if len(history) <= 2 {
+                return compressionResult{}, false
+        }
+
+        budgets := ComputePartitionBudgets(agent.ContextPartition, agent.ContextWindow)
+        if budgets == nil || budgets.HistoryTokens <= 0 {
+                // No valid partition budget — fall back to generic 50% cut
+                return m.forceCompression(sessionKey, "", model)
+        }
+
+        // Compute initial history token estimate
+        estimateHistoryTokens := func(msgs []providers.Message) int {
+                total := 0
+                for _, msg := range msgs {
+                        if model != "" {
+                                total += EstimateMessageTokensForModel(msg, model)
+                        } else {
+                                total += EstimateMessageTokens(msg)
+                        }
+                }
+                return total
+        }
+
+        // Progressively drop the oldest turn until under budget.
+        // We iterate from the oldest turn boundary, removing one turn
+        // at a time, until the history tokens fit within the partition budget.
+        turns := parseTurnBoundaries(history)
+        cutIndex := 0
+        keptHistory := history
+
+        for {
+                currentTokens := estimateHistoryTokens(keptHistory)
+                if currentTokens <= budgets.HistoryTokens {
+                        break // Under budget
+                }
+
+                // Find the next turn boundary to cut at
+                if len(turns) == 0 {
+                        break
+                }
+
+                // Remove the oldest turn: advance cutIndex to the next turn boundary
+                nextCut := turns[0]
+                turns = turns[1:]
+
+                // Don't cut everything — always keep at least the last turn
+                if nextCut >= len(history)-1 {
+                        break
+                }
+
+                cutIndex = nextCut
+                keptHistory = history[cutIndex:]
+
+                if len(keptHistory) <= 1 {
+                        break
+                }
+        }
+
+        if len(keptHistory) == len(history) {
+                // Could not reduce — fall back to generic 50% cut
+                return m.forceCompression(sessionKey, "", model)
+        }
+
+        droppedCount := len(history) - len(keptHistory)
+        m.applyCompression(agent, sessionKey, history, cutIndex, droppedCount, keptHistory)
+        return compressionResult{
+                DroppedMessages:   droppedCount,
+                RemainingMessages: len(keptHistory),
+        }, true
+}
+
+// applyCompression applies the compression result to the session: updates
+// the summary with a compression note, logs reasoning content loss, and
+// persists the new history.
+func (m *legacyContextManager) applyCompression(agent *AgentInstance, sessionKey string, history []providers.Message, cutIndex int, droppedCount int, keptHistory []providers.Message) {
         existingSummary := agent.Sessions.GetSummary(sessionKey)
         compressionNote := fmt.Sprintf(
                 "[Emergency compression dropped %d oldest messages due to context limit]",
@@ -193,17 +296,19 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
         agent.Sessions.SetSummary(sessionKey, compressionNote)
 
         // Count reasoning tokens lost
-        reasoningLost := 0
-        for _, msg := range history[:mid] {
-                if msg.ReasoningContent != "" {
-                        reasoningLost += len(msg.ReasoningContent) / 2 // rough token estimate
+        if cutIndex > 0 && cutIndex <= len(history) {
+                reasoningLost := 0
+                for _, msg := range history[:cutIndex] {
+                        if msg.ReasoningContent != "" {
+                                reasoningLost += len(msg.ReasoningContent) / 2 // rough token estimate
+                        }
                 }
-        }
-        if reasoningLost > 0 {
-                logger.WarnCF("agent", "Emergency compression dropped reasoning content", map[string]any{
-                        "session_key":              sessionKey,
-                        "reasoning_tokens_lost_est": reasoningLost,
-                })
+                if reasoningLost > 0 {
+                        logger.WarnCF("agent", "Emergency compression dropped reasoning content", map[string]any{
+                                "session_key":              sessionKey,
+                                "reasoning_tokens_lost_est": reasoningLost,
+                        })
+                }
         }
 
         agent.Sessions.SetHistory(sessionKey, keptHistory)
@@ -218,11 +323,6 @@ func (m *legacyContextManager) forceCompression(sessionKey string) (compressionR
                 logFields["full_context_mode"] = true
         }
         logger.WarnCF("agent", "Forced compression executed", logFields)
-
-        return compressionResult{
-                DroppedMessages:   droppedCount,
-                RemainingMessages: len(keptHistory),
-        }, true
 }
 
 func (m *legacyContextManager) summarizeSession(agent *AgentInstance, sessionKey string) {

@@ -26,11 +26,11 @@ func computeContextUsage(agent *AgentInstance, sessionKey string) *bus.ContextUs
                 return nil
         }
 
-        // History tokens
+        // History tokens — use model-aware estimation when model is available
         history := agent.Sessions.GetHistory(sessionKey)
         historyTokens := 0
         for _, m := range history {
-                historyTokens += EstimateMessageTokens(m)
+                historyTokens += EstimateMessageTokensForModel(m, agent.Model)
         }
 
         // System message tokens: uses EstimateSystemTokens which mirrors
@@ -45,10 +45,10 @@ func computeContextUsage(agent *AgentInstance, sessionKey string) *bus.ContextUs
                 systemTokens = agent.ContextBuilder.EstimateSystemTokens(summary, nil)
         }
 
-        // Tool definition tokens
+        // Tool definition tokens — use model-aware estimation
         toolTokens := 0
         if agent.Tools != nil {
-                toolTokens = EstimateToolDefsTokens(agent.Tools.ToProviderDefs())
+                toolTokens = EstimateToolDefsTokensForModel(agent.Tools.ToProviderDefs(), agent.Model)
         }
 
         // Used = history + system (includes summary) + tools
