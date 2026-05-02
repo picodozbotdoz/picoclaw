@@ -298,22 +298,12 @@ func extractSearchedSymbols(command string) []string {
 }
 
 // detectBuildCommand tries to detect the appropriate build command for the project.
+// Delegates to DetectProject for workspace-aware detection.
 func detectBuildCommand() string {
-        // Check for Go project
-        if _, err := filepath.Glob("go.mod"); err == nil {
-                return "go build ./..."
-        }
-        // Check for Node.js project
-        if _, err := filepath.Glob("package.json"); err == nil {
-                return "npm run build"
-        }
-        // Check for Makefile
-        if _, err := filepath.Glob("Makefile"); err == nil {
-                return "make"
-        }
-        // Check for Cargo (Rust)
-        if _, err := filepath.Glob("Cargo.toml"); err == nil {
-                return "cargo build"
+        // Fallback: detect in current working directory
+        info := DetectProject(".")
+        if info.BuildCmd != "" && info.Type != ProjectTypeUnknown {
+                return info.BuildCmd
         }
         return "build"
 }
