@@ -218,13 +218,19 @@ func (p *Provider) buildRequestBody(
 
         // Chat Prefix Completion (Beta): Pre-seed assistant response with a prefix.
         // When prefix_completion is set, append an assistant message with prefix: true.
+        // Supports optional reasoning_content prefix for guided reasoning continuation.
         if prefix, ok := options["prefix_completion"].(string); ok && prefix != "" {
                 messagesSlice, _ := requestBody["messages"].([]any)
-                messagesSlice = append(messagesSlice, map[string]any{
-                        "role":   "assistant",
+                assistantMsg := map[string]any{
+                        "role":    "assistant",
                         "content": prefix,
-                        "prefix": true,
-                })
+                        "prefix":  true,
+                }
+                // Add reasoning_content prefix for guided reasoning (DeepSeek V4).
+                if reasoningPrefix, ok := options["reasoning_prefix"].(string); ok && reasoningPrefix != "" {
+                        assistantMsg["reasoning_content"] = reasoningPrefix
+                }
+                messagesSlice = append(messagesSlice, assistantMsg)
                 requestBody["messages"] = messagesSlice
         }
 
@@ -306,6 +312,43 @@ func isDeepSeekHost(apiBase string) bool {
         }
         host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
         return host == "deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
+}
+
+// deepSeekBetaEndpoint returns the beta API endpoint for DeepSeek V4 features
+// (Chat Prefix Completion, Strict Mode). If the apiBase already uses the beta
+// path or is not a DeepSeek host, it returns the apiBase unchanged.
+func deepSeekBetaEndpoint(apiBase string) string {
+        if !isDeepSeekHost(apiBase) {
+                return apiBase // Not a DeepSeek host, no rewriting needed
+        }
+        parsed, err := url.Parse(strings.TrimSpace(apiBase))
+        if err != nil {
+                return apiBase
+        }
+        // If already on beta path, no change needed
+        if strings.HasSuffix(parsed.Path, "/beta") || strings.Contains(parsed.Path, "/beta/") {
+                return apiBase
+        }
+        // Rewrite to the beta endpoint
+        parsed.Path = strings.TrimRight(parsed.Path, "/") + "/beta"
+        return parsed.String()
+}
+
+// effectiveAPIBase returns the API base URL to use for the current request.
+// When DeepSeek V4 beta features (prefix completion, strict mode) are active,
+// it automatically switches to the beta endpoint for DeepSeek hosts.
+func (p *Provider) effectiveAPIBase(options map[string]any) string {
+        needsBeta := false
+        if _, ok := options["prefix_completion"].(string); ok && options["prefix_completion"].(string) != "" {
+                needsBeta = true
+        }
+        if strict, _ := options["strict_tool_calls"].(bool); strict {
+                needsBeta = true
+        }
+        if needsBeta && isDeepSeekHost(p.apiBase) {
+                return deepSeekBetaEndpoint(p.apiBase)
+        }
+        return p.apiBase
 }
 
 func filterDeepSeekReasoningMessages(messages []Message) []Message {
@@ -429,7 +472,11 @@ func (p *Provider) Chat(
                 return nil, fmt.Errorf("failed to marshal request: %w", err)
         }
 
-        req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+        // WS 5.2/5.3: Auto-detect beta endpoint for DeepSeek V4 features
+        // (Chat Prefix Completion, Strict Mode).
+        endpointBase := p.effectiveAPIBase(options)
+
+        req, err := http.NewRequestWithContext(ctx, "POST", endpointBase+"/chat/completions", bytes.NewReader(jsonData))
         if err != nil {
                 return nil, fmt.Errorf("failed to create request: %w", err)
         }
@@ -478,19 +525,38 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
         }
 
         // Try parsing from content first
-        dsmlContent := response.Content
-        toolCalls, remaining, err := ParseDSMLToolCalls(dsmlContent)
-        if err != nil {
-                log.Printf("openai_compat: DSML parse warning: %v", err)
+        if HasDSMLToolCalls(response.Content) {
+                toolCalls, remaining, err := ParseDSMLToolCalls(response.Content)
+                if err != nil {
+                        log.Printf("openai_compat: DSML parse warning: %v", err)
+                }
+                if len(toolCalls) > 0 {
+                        response.ToolCalls = toolCalls
+                        response.Content = remaining
+                        if response.FinishReason == "stop" {
+                                response.FinishReason = "tool_calls"
+                        }
+                        log.Printf("openai_compat: parsed %d tool calls from DSML format", len(toolCalls))
+                        return response
+                }
         }
 
-        if len(toolCalls) > 0 {
-                response.ToolCalls = toolCalls
-                response.Content = remaining
-                if response.FinishReason == "stop" {
-                        response.FinishReason = "tool_calls"
+        // If DSML markers found in reasoning_content but not successfully parsed from content,
+        // try parsing from reasoning_content (edge case for local inference where reasoning
+        // contains tool call planning that leaked into DSML format).
+        if HasDSMLToolCalls(response.ReasoningContent) {
+                toolCalls, remaining, err := ParseDSMLToolCalls(response.ReasoningContent)
+                if err != nil {
+                        log.Printf("openai_compat: DSML parse warning (reasoning): %v", err)
                 }
-                log.Printf("openai_compat: parsed %d tool calls from DSML format", len(toolCalls))
+                if len(toolCalls) > 0 {
+                        response.ToolCalls = toolCalls
+                        response.ReasoningContent = remaining
+                        if response.FinishReason == "stop" {
+                                response.FinishReason = "tool_calls"
+                        }
+                        log.Printf("openai_compat: parsed %d tool calls from DSML in reasoning_content", len(toolCalls))
+                }
         }
 
         return response
@@ -528,7 +594,7 @@ func (p *Provider) ChatStream(
                 return nil, fmt.Errorf("failed to marshal request: %w", err)
         }
 
-        req, err := http.NewRequestWithContext(ctx, "POST", p.apiBase+"/chat/completions", bytes.NewReader(jsonData))
+        req, err := http.NewRequestWithContext(ctx, "POST", p.effectiveAPIBase(options)+"/chat/completions", bytes.NewReader(jsonData))
         if err != nil {
                 return nil, fmt.Errorf("failed to create request: %w", err)
         }
@@ -557,7 +623,15 @@ func (p *Provider) ChatStream(
                 return nil, common.HandleErrorResponse(resp, p.apiBase)
         }
 
-        return parseStreamResponse(ctx, resp.Body, onChunk)
+        llmResp, err := parseStreamResponse(ctx, resp.Body, onChunk)
+        if err != nil {
+                return nil, err
+        }
+
+        // WS 5.1: Apply DSML parsing for streaming responses too.
+        // Local inference engines (vLLM, Ollama) may return DSML-formatted
+        // tool calls even in streaming mode.
+        return maybeParseDSMLResponse(llmResp), nil
 }
 
 // parseStreamResponse parses an OpenAI-compatible SSE stream.
@@ -742,17 +816,34 @@ func buildToolsList(tools []ToolDefinition, nativeSearch bool) []any {
 // buildStrictToolsList creates a tools list with strict: true on each function
 // definition for DeepSeek V4 beta API. When strict mode is enabled, the API
 // validates that tool call outputs conform exactly to the JSON Schema.
+// Schemas that don't conform to strict mode requirements (missing required
+// array, missing additionalProperties: false) are automatically sanitized
+// using SanitizeSchemaForStrictMode. Validation warnings are logged.
 func buildStrictToolsList(tools []ToolDefinition) []any {
         result := make([]any, 0, len(tools))
         for _, t := range tools {
+                // Validate the schema for strict mode compliance
+                var parameters any = t.Function.Parameters
+                if t.Function.Parameters != nil && len(t.Function.Parameters) > 0 {
+                        validationResult := ValidateStrictSchema(t.Function.Parameters, t.Function.Name)
+                        if !validationResult.Valid {
+                                // Auto-sanitize the schema to fix common issues
+                                parameters = SanitizeSchemaForStrictMode(t.Function.Parameters)
+                                if len(validationResult.Errors) > 0 {
+                                        log.Printf("openai_compat: strict mode schema auto-fixed for function %q: %s",
+                                                t.Function.Name, FormatValidationResult(validationResult))
+                                }
+                        }
+                }
+
                 // Create a copy with strict: true added
                 fn := map[string]any{
                         "name":        t.Function.Name,
                         "strict":      true,
                         "description": t.Function.Description,
                 }
-                if t.Function.Parameters != nil {
-                        fn["parameters"] = t.Function.Parameters
+                if parameters != nil {
+                        fn["parameters"] = parameters
                 }
                 result = append(result, map[string]any{
                         "type":     "function",

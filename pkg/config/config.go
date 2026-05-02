@@ -683,6 +683,20 @@ type ModelConfig struct {
         // JSON formatting instructions (required by the API).
         ResponseFormat string `json:"response_format,omitempty" yaml:"response_format,omitempty"`
 
+        // PrefixCompletion enables DeepSeek V4's Chat Prefix Completion (Beta).
+        // When set, the assistant's response will be pre-seeded with this content,
+        // guiding the model to continue from that prefix. This is useful for
+        // forcing specific output formats (e.g., "```python\n" for code).
+        // Requires using the beta endpoint (api_base pointing to api.deepseek.com/beta).
+        PrefixCompletion string `json:"prefix_completion,omitempty" yaml:"prefix_completion,omitempty"`
+
+        // ReasoningPrefix provides reasoning_content for the prefix assistant message
+        // in Chat Prefix Completion mode. When both PrefixCompletion and
+        // ReasoningPrefix are set, the prefix assistant message includes both
+        // reasoning_content and content, enabling "guided reasoning" where the
+        // model continues from a partially-written reasoning chain.
+        ReasoningPrefix string `json:"reasoning_prefix,omitempty" yaml:"reasoning_prefix,omitempty"`
+
         // ContextPartition configures deliberate context window budget allocation
         // for models with very large context windows (e.g., DeepSeek V4 1M).
         // When set, percentages must sum to 100%. Each field represents the

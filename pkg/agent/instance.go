@@ -37,6 +37,8 @@ type AgentInstance struct {
         SummarizeTokenPercent     int
         StrictToolCalls           bool
         ResponseFormat            string
+        PrefixCompletion          string // DeepSeek V4 Chat Prefix Completion (Beta)
+        ReasoningPrefix           string // DeepSeek V4 reasoning_content prefix for prefix completion
         CompressionStrategy       string // "eager", "adaptive", "conservative"
         FullContextMode           bool   // disables summarization, only emergency compression
         StreamingMode             string // "auto" (default), "always", "never"
@@ -198,9 +200,13 @@ func NewAgentInstance(
         // DeepSeek V4 strict mode for tool calls and response format.
         var strictToolCalls bool
         var responseFormat string
+        var prefixCompletion string
+        var reasoningPrefix string
         if mc, err := cfg.GetModelConfig(model); err == nil {
                 strictToolCalls = mc.StrictToolCalls
                 responseFormat = mc.ResponseFormat
+                prefixCompletion = mc.PrefixCompletion
+                reasoningPrefix = mc.ReasoningPrefix
         }
 
         contextWindow := defaults.ContextWindow
@@ -341,6 +347,8 @@ func NewAgentInstance(
                 SummarizeTokenPercent:     summarizeTokenPercent,
                 StrictToolCalls:           strictToolCalls,
                 ResponseFormat:            responseFormat,
+                PrefixCompletion:          prefixCompletion,
+                ReasoningPrefix:           reasoningPrefix,
                 CompressionStrategy:       compressionStrategy,
                 FullContextMode:           fullContextMode,
                 StreamingMode:             streamingMode,

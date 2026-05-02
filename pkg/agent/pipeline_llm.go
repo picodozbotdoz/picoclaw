@@ -64,6 +64,14 @@ func (p *Pipeline) CallLLM(
                 ts.markGracefulTerminalUsed()
         }
 
+        // WS 5.4: When JSON output mode is active, ensure the system/user messages
+        // include JSON formatting instructions. DeepSeek V4 and OpenAI require this
+        // when response_format is json_object; without it, the API returns an error
+        // or produces non-JSON output.
+        if ts.agent.ResponseFormat == "json_object" {
+                exec.callMessages = ensureJSONInstructions(exec.callMessages)
+        }
+
         exec.llmOpts = map[string]any{
                 "max_tokens":       ts.agent.MaxTokens,
                 "temperature":      ts.agent.Temperature,
@@ -109,6 +117,13 @@ func (p *Pipeline) CallLLM(
         // DeepSeek V4 response format (json_object for guaranteed JSON output).
         if ts.agent.ResponseFormat != "" {
                 exec.llmOpts["response_format"] = ts.agent.ResponseFormat
+        }
+        // DeepSeek V4 Chat Prefix Completion (Beta).
+        if ts.agent.PrefixCompletion != "" {
+                exec.llmOpts["prefix_completion"] = ts.agent.PrefixCompletion
+                if ts.agent.ReasoningPrefix != "" {
+                        exec.llmOpts["reasoning_prefix"] = ts.agent.ReasoningPrefix
+                }
         }
 
         exec.llmModel = exec.activeModel
@@ -495,6 +510,15 @@ func (p *Pipeline) CallLLM(
                 if responseContent == "" && exec.response.ReasoningContent != "" && ts.channel != "pico" {
                         responseContent = exec.response.ReasoningContent
                 }
+                // WS 5.4: Validate JSON response when response_format is json_object
+                if ts.agent.ResponseFormat == "json_object" && !validateJSONResponse(responseContent) {
+                        logger.WarnCF("agent", "response_format=json_object but response is not valid JSON",
+                                map[string]any{
+                                        "agent_id":       ts.agent.ID,
+                                        "iteration":      iteration,
+                                        "content_length": len(responseContent),
+                                })
+                }
                 if steerMsgs := al.dequeueSteeringMessagesForScope(ts.sessionKey); len(steerMsgs) > 0 {
                         logger.InfoCF("agent", "Steering arrived after direct LLM response; continuing turn",
                                 map[string]any{
@@ -667,4 +691,66 @@ func callWithStreaming(
         }
 
         return resp, nil
+}
+
+// ensureJSONInstructions checks if the messages already contain JSON formatting
+// instructions. If not, it appends a JSON instruction note to the system message
+// or adds a system message with JSON instructions. This is required by DeepSeek V4
+// and OpenAI when response_format is json_object.
+const jsonInstructionSuffix = "\n\nIMPORTANT: You must respond with valid JSON only. Do not include any text outside the JSON structure."
+
+func ensureJSONInstructions(messages []providers.Message) []providers.Message {
+        if len(messages) == 0 {
+                return messages
+        }
+
+        // Check if any message already contains JSON instructions
+        for _, msg := range messages {
+                if strings.Contains(strings.ToLower(msg.Content), "json") &&
+                        (strings.Contains(strings.ToLower(msg.Content), "respond") ||
+                                strings.Contains(strings.ToLower(msg.Content), "output") ||
+                                strings.Contains(strings.ToLower(msg.Content), "format") ||
+                                strings.Contains(strings.ToLower(msg.Content), "return")) {
+                        return messages // Already has JSON instructions
+                }
+        }
+
+        // Append JSON instruction to the first system message if present
+        for i, msg := range messages {
+                if msg.Role == "system" {
+                        cloned := msg
+                        cloned.Content = cloned.Content + jsonInstructionSuffix
+                        result := make([]providers.Message, len(messages))
+                        copy(result, messages)
+                        result[i] = cloned
+                        return result
+                }
+        }
+
+        // No system message found; prepend one with JSON instructions
+        jsonSystemMsg := providers.Message{
+                Role:    "system",
+                Content: "You must respond with valid JSON only. Do not include any text outside the JSON structure.",
+        }
+        result := make([]providers.Message, 0, len(messages)+1)
+        result = append(result, jsonSystemMsg)
+        result = append(result, messages...)
+        return result
+}
+
+// validateJSONResponse checks if the LLM response content is valid JSON when
+// response_format is json_object. If validation fails, it logs a warning and
+// returns false. The caller can decide how to handle invalid JSON responses.
+func validateJSONResponse(content string) bool {
+        content = strings.TrimSpace(content)
+        if content == "" {
+                return false
+        }
+        // Try to parse as JSON — must be an object or array at the top level
+        var parsed any
+        if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+                return false
+        }
+        // Valid JSON: accept both objects and arrays
+        return true
 }
