@@ -188,24 +188,29 @@ func (p *Pipeline) CallLLM(
                 // based on StreamingMode config and provider capability.
                 useStreaming := shouldUseStreaming(ts.agent, exec.activeProvider)
 
-                if useStreaming {
-                        // Use streaming provider for reduced TTFT and accurate usage data
-                        if sp, ok := exec.activeProvider.(providers.StreamingProvider); ok {
-                                return callWithStreaming(al, sp, exec, providerCtx, messagesForCall, toolDefsForCall, ts)
+                // chatWithFallback invokes a single candidate provider, using streaming
+                // when available. If streaming fails, the fallback chain will naturally
+                // try the next candidate — we do NOT fall through to non-streaming Chat
+                // on the same candidate to avoid double-retrying.
+                chatWithFallback := func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
+                        candidateProvider := exec.activeProvider
+                        if cp, ok := ts.agent.CandidateProviders[providers.ModelKey(provider, model)]; ok {
+                                candidateProvider = cp
                         }
+                        // Use streaming if enabled and the candidate supports it.
+                        if useStreaming {
+                                if sp, ok := candidateProvider.(providers.StreamingProvider); ok {
+                                        return callWithStreaming(al, sp, exec, ctx, messagesForCall, toolDefsForCall, ts, model)
+                                }
+                        }
+                        return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, model, exec.llmOpts)
                 }
 
                 if len(exec.activeCandidates) > 1 && p.Fallback != nil {
                         fbResult, fbErr := p.Fallback.Execute(
                                 providerCtx,
                                 exec.activeCandidates,
-                                func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-                                        candidateProvider := exec.activeProvider
-                                        if cp, ok := ts.agent.CandidateProviders[providers.ModelKey(provider, model)]; ok {
-                                                candidateProvider = cp
-                                        }
-                                        return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, model, exec.llmOpts)
-                                },
+                                chatWithFallback,
                         )
                         if fbErr != nil {
                                 return nil, fbErr
@@ -219,6 +224,13 @@ func (p *Pipeline) CallLLM(
                                 )
                         }
                         return fbResult.Response, nil
+                }
+
+                // No fallback candidates — single provider path.
+                if useStreaming {
+                        if sp, ok := exec.activeProvider.(providers.StreamingProvider); ok {
+                                return callWithStreaming(al, sp, exec, providerCtx, messagesForCall, toolDefsForCall, ts, exec.llmModel)
+                        }
                 }
                 return exec.activeProvider.Chat(providerCtx, messagesForCall, toolDefsForCall, exec.llmModel, exec.llmOpts)
         }
@@ -600,6 +612,8 @@ func shouldUseStreaming(agent *AgentInstance, provider providers.LLMProvider) bo
 // The onChunk callback is used to emit partial content events for real-time
 // display in channels that support it. The final LLMResponse is returned
 // with the same structure as a non-streaming call for compatibility.
+// The model parameter specifies which model to request; when called from the
+// fallback path it differs from exec.llmModel (which is the primary model).
 func callWithStreaming(
         al *AgentLoop,
         sp providers.StreamingProvider,
@@ -608,6 +622,7 @@ func callWithStreaming(
         messages []providers.Message,
         tools []providers.ToolDefinition,
         ts *turnState,
+        model string,
 ) (*providers.LLMResponse, error) {
         // Request include_usage in streaming mode for accurate token counts.
         // This is passed via llmOpts so the provider can add stream_options.
@@ -634,7 +649,7 @@ func callWithStreaming(
                 }
         }
 
-        resp, err := sp.ChatStream(ctx, messages, tools, exec.llmModel, opts, onChunk)
+        resp, err := sp.ChatStream(ctx, messages, tools, model, opts, onChunk)
         if err != nil {
                 return nil, err
         }
