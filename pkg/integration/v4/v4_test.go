@@ -9,7 +9,6 @@ import (
         "fmt"
         "io"
         "net/http"
-        "os"
         "strings"
         "testing"
         "time"
@@ -21,16 +20,6 @@ import (
 
 // Aliases for shorter code
 type Message = protocoltypes.Message
-
-// getDeepSeekAPIKey returns the DeepSeek API key from the environment.
-func getDeepSeekAPIKey(t *testing.T) string {
-        t.Helper()
-        key := os.Getenv("DEEPSEEK_API_KEY")
-        if key == "" {
-                t.Skip("DEEPSEEK_API_KEY not set, skipping DeepSeek V4 integration test")
-        }
-        return key
-}
 
 // newV4Provider creates a Provider configured for DeepSeek V4.
 func newV4Provider(t *testing.T) *openai_compat.Provider {
