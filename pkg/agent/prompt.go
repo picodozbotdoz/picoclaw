@@ -216,7 +216,7 @@ func builtinPromptSources() []PromptSourceDescriptor {
                         Owner:           "context_inject",
                         Description:     "Injected/retrieved context from context_inject tool",
                         Allowed:         []PromptPlacement{{Layer: PromptLayerContext, Slot: PromptSlotRetrievedContext}},
-                        StableByDefault: true,
+                        StableByDefault: false, // volatile: content changes during a turn, not cacheable
                 },
                 {
                         ID:              PromptSourceRuntime,
