@@ -124,6 +124,8 @@ func (es *EventSubscriber) updateSession(evt agent.Event) {
                 args[13] = 1  // turn_count
                 args[14] = 0  // compress_count
                 es.store.metrics.ActiveSessions.Add(1)
+        case agent.EventKindTurnEnd:
+                es.store.metrics.ActiveSessions.Add(-1)
         case agent.EventKindLLMResponse:
                 args[11] = 1 // llm_call_count
                 if _, ok := evt.Payload.(agent.LLMResponsePayload); ok {

@@ -704,9 +704,11 @@ func parseStreamResponse(
                         Usage *UsageInfo `json:"usage"`
                 }
 
-                if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-                        continue // skip malformed chunks
-                }
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			logger.DebugCF("provider", "Skipping malformed SSE chunk",
+				map[string]any{"data_len": len(data), "error": err.Error()})
+			continue
+		}
 
                 if chunk.Usage != nil {
                         usage = chunk.Usage

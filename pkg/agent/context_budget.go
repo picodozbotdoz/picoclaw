@@ -6,6 +6,7 @@
 package agent
 
 import (
+        "github.com/sipeed/picoclaw/pkg/logger"
         "github.com/sipeed/picoclaw/pkg/providers"
         "github.com/sipeed/picoclaw/pkg/tokenizer"
 )
@@ -143,6 +144,20 @@ func isOverContextBudget(
                 toolTokens = EstimateToolDefsTokens(toolDefs)
         }
         total := msgTokens + toolTokens + maxTokens
+        overBudget := total > contextWindow
 
-        return total > contextWindow
+        if overBudget {
+                logger.InfoCF("agent", "Context budget exceeded",
+                        map[string]any{
+                                "msg_tokens":    msgTokens,
+                                "tool_tokens":   toolTokens,
+                                "max_tokens":    maxTokens,
+                                "total":         total,
+                                "context_window": contextWindow,
+                                "overflow":      total - contextWindow,
+                                "model":         model,
+                        })
+        }
+
+        return overBudget
 }
