@@ -254,10 +254,16 @@ func TestProcessMessage_IncludesCurrentSenderInDynamicContext(t *testing.T) {
                 t.Fatal("provider did not receive any messages")
         }
 
-        systemPrompt := provider.lastMessages[0].Content
+        // Sender info is now in the volatile system message (not the first/stable one)
+        var allSystemContent string
+        for _, msg := range provider.lastMessages {
+                if msg.Role == "system" {
+                        allSystemContent += msg.Content
+                }
+        }
         wantSender := "## Current Sender\nCurrent sender: Alice (ID: discord:123)"
-        if !strings.Contains(systemPrompt, wantSender) {
-                t.Fatalf("system prompt missing sender context %q:\n%s", wantSender, systemPrompt)
+        if !strings.Contains(allSystemContent, wantSender) {
+                t.Fatalf("system prompt missing sender context %q:\n%s", wantSender, allSystemContent)
         }
 
         lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
@@ -310,12 +316,18 @@ func TestProcessMessage_UseCommandLoadsRequestedSkill(t *testing.T) {
                 t.Fatal("provider did not receive any messages")
         }
 
-        systemPrompt := provider.lastMessages[0].Content
-        if !strings.Contains(systemPrompt, "# Active Skills") {
-                t.Fatalf("system prompt missing active skills section:\n%s", systemPrompt)
+        // Active skills are now in the volatile system message, not the first (stable) one
+        var allSystemContent string
+        for _, msg := range provider.lastMessages {
+                if msg.Role == "system" {
+                        allSystemContent += msg.Content
+                }
         }
-        if !strings.Contains(systemPrompt, "### Skill: shell") {
-                t.Fatalf("system prompt missing requested skill content:\n%s", systemPrompt)
+        if !strings.Contains(allSystemContent, "# Active Skills") {
+                t.Fatalf("system prompt missing active skills section:\n%s", allSystemContent)
+        }
+        if !strings.Contains(allSystemContent, "### Skill: shell") {
+                t.Fatalf("system prompt missing requested skill content:\n%s", allSystemContent)
         }
 
         lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
@@ -379,12 +391,16 @@ func TestProcessMessage_BtwCommandRunsWithoutPersistingHistory(t *testing.T) {
         if len(provider.lastMessages) == 0 {
                 t.Fatal("provider did not receive any messages")
         }
-        if len(provider.lastMessages) != 4 {
-                t.Fatalf("provider messages len = %d, want 4 (system + prior history + user)", len(provider.lastMessages))
+        // After DeepSeek V4 caching optimization, messages are:
+        // [stable_system, volatile_system, user_summary, assistant_summary, history..., user]
+        // Expected count: 2 system + 2 summary pair + 2 history + 1 user = 7
+        if len(provider.lastMessages) != 7 {
+                t.Fatalf("provider messages len = %d, want 7 (stable system + volatile system + summary pair + prior history + user)", len(provider.lastMessages))
         }
 
-        if !reflect.DeepEqual(provider.lastMessages[1:3], initialHistory) {
-                t.Fatalf("provider history = %#v, want %#v", provider.lastMessages[1:3], initialHistory)
+        // History starts after the summary pair (index 4)
+        if !reflect.DeepEqual(provider.lastMessages[4:6], initialHistory) {
+                t.Fatalf("provider history = %#v, want %#v", provider.lastMessages[4:6], initialHistory)
         }
 
         lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
@@ -436,12 +452,18 @@ func TestProcessMessage_BtwCommandIncludesRequestContextAndMedia(t *testing.T) {
                 t.Fatal("provider did not receive any messages")
         }
 
-        systemPrompt := provider.lastMessages[0].Content
-        if !strings.Contains(systemPrompt, "## Current Session\nChannel: discord\nChat ID: group-1") {
-                t.Fatalf("system prompt missing current session context:\n%s", systemPrompt)
+        // Dynamic context (session, sender) is now in the volatile system message
+        var allSystemContent string
+        for _, msg := range provider.lastMessages {
+                if msg.Role == "system" {
+                        allSystemContent += msg.Content
+                }
         }
-        if !strings.Contains(systemPrompt, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
-                t.Fatalf("system prompt missing current sender context:\n%s", systemPrompt)
+        if !strings.Contains(allSystemContent, "## Current Session\nChannel: discord\nChat ID: group-1") {
+                t.Fatalf("system prompt missing current session context:\n%s", allSystemContent)
+        }
+        if !strings.Contains(allSystemContent, "## Current Sender\nCurrent sender: Alice (ID: discord:123)") {
+                t.Fatalf("system prompt missing current sender context:\n%s", allSystemContent)
         }
 
         lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
@@ -737,9 +759,15 @@ func TestProcessMessage_UseCommandArmsSkillForNextMessage(t *testing.T) {
                 t.Fatal("provider did not receive any messages")
         }
 
-        systemPrompt := provider.lastMessages[0].Content
-        if !strings.Contains(systemPrompt, "### Skill: shell") {
-                t.Fatalf("system prompt missing pending skill content:\n%s", systemPrompt)
+        // Pending skill content is now in the volatile system message
+        var allSystemContent string
+        for _, msg := range provider.lastMessages {
+                if msg.Role == "system" {
+                        allSystemContent += msg.Content
+                }
+        }
+        if !strings.Contains(allSystemContent, "### Skill: shell") {
+                t.Fatalf("system prompt missing pending skill content:\n%s", allSystemContent)
         }
         lastMessage := provider.lastMessages[len(provider.lastMessages)-1]
         if lastMessage.Role != "user" || lastMessage.Content != "explain how to list files" {

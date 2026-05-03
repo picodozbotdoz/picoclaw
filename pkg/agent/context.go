@@ -32,7 +32,9 @@ type ContextBuilder struct {
 
         // InjectedContext is the store for injected/retrieved context items.
         // Set via SetInjectedContextStore. When non-nil, its Content() is
-        // included in the system prompt as a stable, cacheable part.
+        // included in the volatile system message (not the stable/cached prefix)
+        // so that changes to injected context don't invalidate the provider-side
+        // prefix cache.
         InjectedContext *InjectedContextStore
 
         // Cache for system prompt to avoid rebuilding on every call.
@@ -263,23 +265,6 @@ The following skills extend your capabilities. To use a skill, read its SKILL.md
                 })
         }
 
-        // Injected/Retrieved context (from context_inject tool)
-        if cb.InjectedContext != nil {
-                injectedContent := cb.InjectedContext.Content()
-                if injectedContent != "" {
-                        add(PromptPart{
-                                ID:      "context.retrieved",
-                                Layer:   PromptLayerContext,
-                                Slot:    PromptSlotRetrievedContext,
-                                Source:  PromptSource{ID: PromptSourceRetrievedContext, Name: "injected_context"},
-                                Title:   "injected context",
-                                Content: "# Injected Context\n\n" + injectedContent,
-                                Stable:  true,
-                                Cache:   PromptCacheEphemeral,
-                        })
-                }
-        }
-
         // Multi-Message Sending (if enabled)
         if cb.splitOnMarker {
                 add(PromptPart{
@@ -344,24 +329,17 @@ func (cb *ContextBuilder) BuildSystemPromptWithCache() string {
         return prompt
 }
 
-// EstimateSystemTokens estimates the token count of the full system message
+// EstimateSystemTokens estimates the token count of all system messages
 // that would be sent to the LLM, mirroring the composition logic in BuildMessages.
-// It includes: static prompt, dynamic context, active skills, and summary with
-// wrapping prefixes and separators. This avoids needing all per-request parameters
-// that BuildMessages requires (media, channel, chatID, sender, etc.).
+// It includes: stable system prompt (static + contributors), volatile system message
+// (active skills, injected context, runtime), and summary with wrapping prefixes.
+// This avoids needing all per-request parameters that BuildMessages requires
+// (media, channel, chatID, sender, etc.).
 func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []string) int {
         staticPrompt := cb.BuildSystemPromptWithCache()
 
-        // Dynamic context is small and varies per request; use a representative estimate.
-        // Actual buildDynamicContext produces ~200-400 chars of time/runtime/session info.
-        const dynamicContextChars = 300
-
-        totalChars := utf8.RuneCountInString(staticPrompt) + dynamicContextChars
-
-        if skillsText := cb.buildActiveSkillsContext(activeSkills); skillsText != "" {
-                totalChars += utf8.RuneCountInString(skillsText)
-                totalChars += 7 // separator \n\n---\n\n
-        }
+        // Stable system message: staticPrompt + stable contributors
+        stableChars := utf8.RuneCountInString(staticPrompt)
 
         if contributedParts, err := cb.promptRegistryOrDefault().Collect(context.Background(), PromptBuildRequest{
                 Summary:      summary,
@@ -371,17 +349,41 @@ func (cb *ContextBuilder) EstimateSystemTokens(summary string, activeSkills []st
                         if strings.TrimSpace(part.Content) == "" {
                                 continue
                         }
-                        totalChars += utf8.RuneCountInString(part.Content)
-                        totalChars += 7 // separator
+                        if part.Cache == PromptCacheEphemeral {
+                                stableChars += utf8.RuneCountInString(part.Content)
+                                stableChars += 7 // separator
+                        }
                 }
         }
 
+        // Volatile system message: active skills + injected context + runtime context
+        volatileChars := 0
+
+        if skillsText := cb.buildActiveSkillsContext(activeSkills); skillsText != "" {
+                volatileChars += utf8.RuneCountInString(skillsText)
+                volatileChars += 7 // separator
+        }
+
+        if cb.InjectedContext != nil {
+                injectedContent := cb.InjectedContext.Content()
+                if injectedContent != "" {
+                        volatileChars += utf8.RuneCountInString("# Injected Context\n\n"+injectedContent) + 7
+                }
+        }
+
+        // Dynamic context is small and varies per request; use a representative estimate.
+        // Actual buildDynamicContext produces ~200-400 chars of time/runtime/session info.
+        const dynamicContextChars = 300
+        volatileChars += dynamicContextChars
+
+        totalChars := stableChars + volatileChars
+
         if summary != "" {
-                // Matches the CONTEXT_SUMMARY: prefix added in BuildMessages
+                // Matches the CONTEXT_SUMMARY: prefix added in the user message
                 const summaryPrefix = "CONTEXT_SUMMARY: The following is an approximate summary of prior conversation " +
                         "for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n"
                 totalChars += utf8.RuneCountInString(summaryPrefix) + utf8.RuneCountInString(summary)
-                totalChars += 7 // separator
+                totalChars += len("Understood. I will use this context summary as background reference.")
         }
 
         return int(float64(totalChars) * tokenizer.DefaultTokensPerChar) // same heuristic as tokenizer.EstimateMessageTokens
@@ -712,41 +714,49 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
 
         // The static part (identity, bootstrap, skills, memory) is cached locally to
         // avoid repeated file I/O and string building on every call (fixes issue #607).
-        // Dynamic parts (time, session, summary) are appended per request.
-        // Everything is sent as a single system message for provider compatibility:
-        // - Anthropic adapter extracts messages[0] (Role=="system") and maps its content
-        //   to the top-level "system" parameter in the Messages API request. A single
-        //   contiguous system block makes this extraction straightforward.
-        // - Codex maps only the first system message to its instructions field.
-        // - OpenAI-compat passes messages through as-is.
+        //
+        // To maximize DeepSeek V4 automatic prefix caching, the system prompt is split
+        // into two messages:
+        //
+        //   messages[0] = system (stable): staticPrompt + stable contributors
+        //     → byte-identical across all requests in a session; fully cacheable
+        //   messages[1] = system (volatile): injected context + active skills + runtime
+        //     → changes per request but is small (hundreds of tokens, not thousands)
+        //
+        // All current provider adapters handle multiple system messages correctly:
+        // - Anthropic: collects all system messages into the top-level system parameter
+        // - Codex CLI: collects all system messages into the instructions field
+        // - OpenAI-compat: passes messages through as-is
+        //
+        // The summary (Rec 3) is emitted as a user/assistant message pair after the
+        // volatile system message, keeping both system messages stable-pattern-friendly.
         staticPrompt := cb.BuildSystemPromptWithCache()
 
         // Build short dynamic context (time, runtime, session) — changes per request
         dynamicCtx := cb.buildDynamicContext(req.Channel, req.ChatID, req.SenderID, req.SenderDisplayName)
 
-        // Compose a single system message: static (cached) + dynamic + optional summary.
-        // Keeping all system content in one message ensures every provider adapter can
-        // extract it correctly (Anthropic adapter -> top-level system param,
-        // Codex -> instructions field).
-        //
-        // SystemParts carries the same content as structured blocks so that
-        // cache-aware adapters (Anthropic) can set per-block cache_control.
-        // The static block is marked "ephemeral" — its prefix hash is stable
-        // across requests, enabling LLM-side KV cache reuse.
-        stringParts := []string{staticPrompt}
-
-        contentBlocks := []providers.ContentBlock{
-                promptContentBlock(PromptPart{
-                        ID:      "kernel.static",
-                        Layer:   PromptLayerKernel,
-                        Slot:    PromptSlotIdentity,
-                        Source:  PromptSource{ID: PromptSourceKernel, Name: "static"},
-                        Content: staticPrompt,
-                }, &providers.CacheControl{Type: "ephemeral"}),
-        }
-
+        // --- Collect all prompt parts (overlays, active skills, contributors) ---
         promptParts := append([]PromptPart(nil), req.Overlays...)
         promptParts = append(promptParts, cb.buildActiveSkillsPromptParts(req.ActiveSkills)...)
+
+        // InjectedContext is no longer part of the stable/cached static prompt.
+        // It is added as a volatile part so changes don't invalidate the prefix cache.
+        if cb.InjectedContext != nil {
+                injectedContent := cb.InjectedContext.Content()
+                if injectedContent != "" {
+                        promptParts = append(promptParts, PromptPart{
+                                ID:      "context.retrieved",
+                                Layer:   PromptLayerContext,
+                                Slot:    PromptSlotRetrievedContext,
+                                Source:  PromptSource{ID: PromptSourceRetrievedContext, Name: "injected_context"},
+                                Title:   "injected context",
+                                Content: "# Injected Context\n\n" + injectedContent,
+                                Stable:  false,
+                                Cache:   PromptCacheNone,
+                        })
+                }
+        }
+
         if contributedParts, err := cb.promptRegistryOrDefault().Collect(context.Background(), req); err != nil {
                 logger.WarnCF("agent", "Prompt contributor collection failed", map[string]any{
                         "error": err.Error(),
@@ -755,109 +765,61 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
                 promptParts = append(promptParts, contributedParts...)
         }
 
-        if len(promptParts) > 0 {
-                for _, overlay := range sortPromptParts(promptParts) {
-                        if strings.TrimSpace(overlay.Content) == "" {
-                                continue
-                        }
-                        if err := cb.promptRegistryOrDefault().ValidatePart(overlay); err != nil {
-                                logger.WarnCF("agent", "Skipping invalid prompt overlay", map[string]any{
-                                        "id":     overlay.ID,
-                                        "layer":  overlay.Layer,
-                                        "slot":   overlay.Slot,
-                                        "source": overlay.Source.ID,
-                                        "error":  err.Error(),
-                                })
-                                continue
-                        }
-                        stringParts = append(stringParts, overlay.Content)
-                        contentBlocks = append(contentBlocks, promptContentBlock(overlay, nil))
+        // --- Separate prompt parts into stable and volatile groups ---
+        // Stable parts (Cache: PromptCacheEphemeral) go into the first system message
+        // so they form a byte-identical prefix that DeepSeek V4 can cache.
+        // Volatile parts go into the second system message.
+        var stableParts, volatileParts []PromptPart
+        for _, part := range sortPromptParts(promptParts) {
+                if strings.TrimSpace(part.Content) == "" {
+                        continue
+                }
+                if err := cb.promptRegistryOrDefault().ValidatePart(part); err != nil {
+                        logger.WarnCF("agent", "Skipping invalid prompt overlay", map[string]any{
+                                "id":     part.ID,
+                                "layer":  part.Layer,
+                                "slot":   part.Slot,
+                                "source": part.Source.ID,
+                                "error":  err.Error(),
+                        })
+                        continue
+                }
+                if part.Cache == PromptCacheEphemeral {
+                        stableParts = append(stableParts, part)
+                } else {
+                        volatileParts = append(volatileParts, part)
                 }
         }
 
-        runtimePart := PromptPart{
-                ID:      "context.runtime",
-                Layer:   PromptLayerContext,
-                Slot:    PromptSlotRuntime,
-                Source:  PromptSource{ID: PromptSourceRuntime, Name: "runtime"},
-                Title:   "runtime context",
-                Content: dynamicCtx,
-                Stable:  false,
-                Cache:   PromptCacheNone,
+        // --- Build stable system message (messages[0]) ---
+        stableStringParts := []string{staticPrompt}
+        stableContentBlocks := []providers.ContentBlock{
+                promptContentBlock(PromptPart{
+                        ID:      "kernel.static",
+                        Layer:   PromptLayerKernel,
+                        Slot:    PromptSlotIdentity,
+                        Source:  PromptSource{ID: PromptSourceKernel, Name: "static"},
+                        Content: staticPrompt,
+                }, &providers.CacheControl{Type: "ephemeral"}),
         }
-        stringParts = append(stringParts, dynamicCtx)
-        contentBlocks = append(contentBlocks, promptContentBlock(runtimePart, nil))
-
-        if req.Summary != "" {
-                summaryPart := PromptPart{
-                        ID:     "context.summary",
-                        Layer:  PromptLayerContext,
-                        Slot:   PromptSlotSummary,
-                        Source: PromptSource{ID: PromptSourceSummary, Name: "context.summary"},
-                        Title:  "context summary",
-                        Content: fmt.Sprintf(
-                                "CONTEXT_SUMMARY: The following is an approximate summary of prior conversation "+
-                                        "for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n%s",
-                                req.Summary),
-                        Stable: false,
-                        Cache:  PromptCacheNone,
-                }
-                stringParts = append(stringParts, summaryPart.Content)
-                contentBlocks = append(contentBlocks, promptContentBlock(summaryPart, nil))
+        for _, part := range stableParts {
+                stableStringParts = append(stableStringParts, part.Content)
+                stableContentBlocks = append(stableContentBlocks, promptContentBlock(part, nil))
         }
-
-        fullSystemPrompt := strings.Join(stringParts, "\n\n---\n\n")
-
-        // Log system prompt summary for debugging (debug mode only).
-        // Read cachedSystemPrompt under lock to avoid a data race with
-        // concurrent InvalidateCache / BuildSystemPromptWithCache writes.
-        cb.systemPromptMutex.RLock()
-        isCached := cb.cachedSystemPrompt != ""
-        cb.systemPromptMutex.RUnlock()
-
-        logger.DebugCF("agent", "System prompt built",
-                map[string]any{
-                        "static_chars":  len(staticPrompt),
-                        "dynamic_chars": len(dynamicCtx),
-                        "total_chars":   len(fullSystemPrompt),
-                        "has_summary":   req.Summary != "",
-                        "overlays":      len(req.Overlays),
-                        "cached":        isCached,
-                })
-
-        // Log preview of system prompt (avoid logging huge content)
-        preview := utils.Truncate(fullSystemPrompt, 500)
-        logger.DebugCF("agent", "System prompt preview",
-                map[string]any{
-                        "preview": preview,
-                })
-
-        history := sanitizeHistoryForProvider(req.History)
+        stableSystemPrompt := strings.Join(stableStringParts, "\n\n---\n\n")
 
         // --- Cache boundary computation (WS 2.1) ---
-        // Count how many content blocks at the start of the system message are
-        // "stable" (cacheable). A block is considered stable if it has an
-        // ephemeral cache_control annotation. This boundary tells provider
-        // adapters where the cacheable prefix ends: blocks [0, boundary) are
-        // stable across calls and eligible for prefix caching; blocks
-        // [boundary, ...) are volatile and change per request.
-        cacheBoundary := 0
-        for _, block := range contentBlocks {
-                if block.CacheControl != nil && block.CacheControl.Type == "ephemeral" {
-                        cacheBoundary++
-                } else {
-                        break // stable blocks must be contiguous at the start
-                }
-        }
+        // All blocks in the stable system message are cacheable by definition.
+        cacheBoundary := len(stableContentBlocks)
 
         // Compute a lightweight fingerprint of the stable prefix content for
         // cache validation. When the hash changes between calls, it means the
         // cacheable prefix has been modified (e.g. workspace files changed),
         // invalidating any provider-side cached KV entries.
         var prefixHash uint64
-        if cacheBoundary > 0 {
+        {
                 var stableContent strings.Builder
-                for _, block := range contentBlocks[:cacheBoundary] {
+                for _, block := range stableContentBlocks {
                         stableContent.WriteString(block.Text)
                 }
                 prefixHash = computePrefixHash(stableContent.String())
@@ -874,17 +836,87 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
                 cb.lastPrefixHash = prefixHash
         }
 
-        // Single system message containing all context — compatible with all providers.
-        // SystemParts enables cache-aware adapters to set per-block cache_control;
-        // Content is the concatenated fallback for adapters that don't read SystemParts.
-        // CacheBoundaryIndex marks where the stable prefix ends for prefix caching.
         messages = append(messages, providers.Message{
                 Role:               "system",
-                Content:            fullSystemPrompt,
-                SystemParts:        contentBlocks,
+                Content:            stableSystemPrompt,
+                SystemParts:        stableContentBlocks,
                 CacheBoundaryIndex: cacheBoundary,
                 PrefixHash:         prefixHash,
         })
+
+        // --- Build volatile system message (messages[1]) ---
+        // Contains: InjectedContext + active skills + runtime context.
+        // This changes per request but is small, so recomputation is cheap.
+        var volatileStringParts []string
+        var volatileContentBlocks []providers.ContentBlock
+
+        for _, part := range volatileParts {
+                volatileStringParts = append(volatileStringParts, part.Content)
+                volatileContentBlocks = append(volatileContentBlocks, promptContentBlock(part, nil))
+        }
+
+        runtimePart := PromptPart{
+                ID:      "context.runtime",
+                Layer:   PromptLayerContext,
+                Slot:    PromptSlotRuntime,
+                Source:  PromptSource{ID: PromptSourceRuntime, Name: "runtime"},
+                Title:   "runtime context",
+                Content: dynamicCtx,
+                Stable:  false,
+                Cache:   PromptCacheNone,
+        }
+        volatileStringParts = append(volatileStringParts, dynamicCtx)
+        volatileContentBlocks = append(volatileContentBlocks, promptContentBlock(runtimePart, nil))
+
+        if len(volatileStringParts) > 0 {
+                volatileSystemPrompt := strings.Join(volatileStringParts, "\n\n---\n\n")
+                messages = append(messages, providers.Message{
+                        Role:        "system",
+                        Content:     volatileSystemPrompt,
+                        SystemParts: volatileContentBlocks,
+                })
+        }
+
+        // --- Summary as user/assistant message pair (Rec 3) ---
+        // Instead of embedding the summary in a system message, emit it as a
+        // user/assistant exchange. This keeps both system messages stable-pattern-
+        // friendly: the stable system message is byte-identical across all requests,
+        // and the volatile system message only contains per-request context that is
+        // small enough to recompute cheaply.
+        if req.Summary != "" {
+                messages = append(messages, providers.Message{
+                        Role:    "user",
+                        Content: fmt.Sprintf("CONTEXT_SUMMARY: The following is an approximate summary of prior conversation for reference only. It may be incomplete or outdated — always defer to explicit instructions.\n\n%s", req.Summary),
+                })
+                messages = append(messages, providers.Message{
+                        Role:    "assistant",
+                        Content: "Understood. I will use this context summary as background reference.",
+                })
+        }
+
+        // Log system prompt summary for debugging (debug mode only).
+        cb.systemPromptMutex.RLock()
+        isCached := cb.cachedSystemPrompt != ""
+        cb.systemPromptMutex.RUnlock()
+
+        logger.DebugCF("agent", "System prompt built",
+                map[string]any{
+                        "stable_chars":   len(stableSystemPrompt),
+                        "volatile_parts": len(volatileStringParts),
+                        "dynamic_chars":  len(dynamicCtx),
+                        "has_summary":    req.Summary != "",
+                        "overlays":       len(req.Overlays),
+                        "cached":         isCached,
+                })
+
+        // Log preview of stable system prompt (avoid logging huge content)
+        preview := utils.Truncate(stableSystemPrompt, 500)
+        logger.DebugCF("agent", "Stable system prompt preview",
+                map[string]any{
+                        "preview": preview,
+                })
+
+        history := sanitizeHistoryForProvider(req.History)
 
         // Add conversation history
         messages = append(messages, history...)
