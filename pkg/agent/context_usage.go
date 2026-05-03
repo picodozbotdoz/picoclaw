@@ -2,6 +2,7 @@ package agent
 
 import (
         "github.com/sipeed/picoclaw/pkg/bus"
+        "github.com/sipeed/picoclaw/pkg/logger"
         "github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
 
@@ -135,4 +136,14 @@ func UpdateUsageFromAPI(usage *bus.ContextUsage, respUsage *protocoltypes.UsageI
                         usage.ReasoningTokens = respUsage.CompletionTokensDetails.ReasoningTokens
                 }
         }
+
+        // Log when API data replaces heuristics for observability
+        logger.DebugCF("agent", "Context usage updated from API",
+                map[string]any{
+                        "prompt_tokens":     respUsage.PromptTokens,
+                        "completion_tokens": respUsage.CompletionTokens,
+                        "cache_hit_tokens":  respUsage.PromptCacheHitTokens,
+                        "reasoning_tokens":  usage.ReasoningTokens,
+                        "used_percent":      usage.UsedPercent,
+                })
 }

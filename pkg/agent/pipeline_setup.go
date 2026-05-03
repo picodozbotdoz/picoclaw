@@ -5,6 +5,7 @@ package agent
 import (
         "context"
         "strings"
+        "time"
 
         "github.com/sipeed/picoclaw/pkg/logger"
         "github.com/sipeed/picoclaw/pkg/providers"
@@ -14,6 +15,7 @@ import (
 // turnExecution populated with history, messages, and candidate selection.
 // It replaces lines 56-145 of the original runTurn.
 func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution, error) {
+        setupStart := time.Now()
         cfg := p.Cfg
         maxMediaSize := cfg.Agents.Defaults.GetMaxMediaSize()
 
@@ -148,6 +150,18 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
         exec.activeModel = activeModel
         exec.activeProvider = activeProvider
         exec.usedLight = usedLight
+
+        setupDuration := time.Since(setupStart)
+        logger.InfoCF("agent", "Turn setup completed",
+                map[string]any{
+                        "session_key":  ts.sessionKey,
+                        "agent_id":     ts.agent.ID,
+                        "setup_ms":     setupDuration.Milliseconds(),
+                        "model":        activeModel,
+                        "used_light":   usedLight,
+                        "candidates":   len(activeCandidates),
+                        "history_msgs": len(history),
+                })
 
         return exec, nil
 }
