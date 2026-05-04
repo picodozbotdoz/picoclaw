@@ -40,7 +40,7 @@ func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
 
 	findPicoclawBinaryForInfo = func() string { return "picoclaw" }
 	runPicoclawVersionOutput = func(_ context.Context, _ string) (string, error) {
-		return "🦞 picoclaw v1.2.3 (git: deadbeef)\n  Build: 2026-03-27T12:34:56Z\n  Go: go1.25.8\n", nil
+		return "🦞 picoclaw v1.2.3 (git: deadbeef, branch: main)\n  Build: 2026-03-27T12:34:56Z\n  Go: go1.25.8\n", nil
 	}
 
 	h := NewHandler("")
@@ -66,6 +66,9 @@ func TestGetSystemVersionUsesPicoclawBinaryInfo(t *testing.T) {
 	if got.GitCommit != "deadbeef" {
 		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "deadbeef")
 	}
+	if got.GitBranch != "main" {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, "main")
+	}
 	if got.BuildTime != "2026-03-27T12:34:56Z" {
 		t.Fatalf("build_time = %q, want %q", got.BuildTime, "2026-03-27T12:34:56Z")
 	}
@@ -80,6 +83,7 @@ func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 	expected := systemVersionResponse{
 		Version:   "v9.9.9",
 		GitCommit: "cafebabe",
+		GitBranch: "regress/monitoring",
 		BuildTime: "2026-03-27T10:43:34+0000",
 		GoVersion: "go1.25.8",
 	}
@@ -113,6 +117,9 @@ func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 	if got.GitCommit != expected.GitCommit {
 		t.Fatalf("git_commit = %q, want %q", got.GitCommit, expected.GitCommit)
 	}
+	if got.GitBranch != expected.GitBranch {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, expected.GitBranch)
+	}
 	if got.BuildTime != expected.BuildTime {
 		t.Fatalf("build_time = %q, want %q", got.BuildTime, expected.BuildTime)
 	}
@@ -124,7 +131,7 @@ func TestGetSystemVersionFallsBackToLauncherInfoWhenCommandFails(t *testing.T) {
 func TestParsePicoclawVersionOutput(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	raw := "\u001b[1;31m████\u001b[0m\n🦞 picoclaw 18ec263 (git: 18ec2631)\n  Build: 2026-03-27T10:43:34+0000\n  Go: go1.25.8\n"
+	raw := "\u001b[1;31m████\u001b[0m\n🦞 picoclaw 18ec263 (git: 18ec2631, branch: main)\n  Build: 2026-03-27T10:43:34+0000\n  Go: go1.25.8\n"
 	got, ok := parsePicoclawVersionOutput(raw)
 	if !ok {
 		t.Fatal("parsePicoclawVersionOutput() should parse valid output")
@@ -135,11 +142,90 @@ func TestParsePicoclawVersionOutput(t *testing.T) {
 	if got.GitCommit != "18ec2631" {
 		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "18ec2631")
 	}
+	if got.GitBranch != "main" {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, "main")
+	}
 	if got.BuildTime != "2026-03-27T10:43:34+0000" {
 		t.Fatalf("build_time = %q, want %q", got.BuildTime, "2026-03-27T10:43:34+0000")
 	}
 	if got.GoVersion != "go1.25.8" {
 		t.Fatalf("go_version = %q, want %q", got.GoVersion, "go1.25.8")
+	}
+}
+
+func TestParsePicoclawVersionOutputGitCommitOnly(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "picoclaw v1.2.3 (git: abc123)\n  Build: 2026-01-01T00:00:00Z\n  Go: go1.25.8\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if !ok {
+		t.Fatal("parsePicoclawVersionOutput() should parse valid output")
+	}
+	if got.Version != "v1.2.3" {
+		t.Fatalf("version = %q, want %q", got.Version, "v1.2.3")
+	}
+	if got.GitCommit != "abc123" {
+		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "abc123")
+	}
+	if got.GitBranch != "" {
+		t.Fatalf("git_branch = %q, want empty", got.GitBranch)
+	}
+}
+
+func TestParsePicoclawVersionOutputBranchOnly(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "picoclaw v1.2.3 (branch: feature/test)\n  Build: 2026-01-01T00:00:00Z\n  Go: go1.25.8\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if !ok {
+		t.Fatal("parsePicoclawVersionOutput() should parse valid output")
+	}
+	if got.Version != "v1.2.3" {
+		t.Fatalf("version = %q, want %q", got.Version, "v1.2.3")
+	}
+	if got.GitCommit != "" {
+		t.Fatalf("git_commit = %q, want empty", got.GitCommit)
+	}
+	if got.GitBranch != "feature/test" {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, "feature/test")
+	}
+}
+
+func TestParsePicoclawVersionOutputBranchWithSlash(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "picoclaw v2.0.0 (git: c739d772, branch: exp/improve_context_static_20260503)\n  Build: 2026-05-03T07:17:01+0000\n  Go: go1.25.9\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if !ok {
+		t.Fatal("parsePicoclawVersionOutput() should parse valid output")
+	}
+	if got.Version != "v2.0.0" {
+		t.Fatalf("version = %q, want %q", got.Version, "v2.0.0")
+	}
+	if got.GitCommit != "c739d772" {
+		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "c739d772")
+	}
+	if got.GitBranch != "exp/improve_context_static_20260503" {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, "exp/improve_context_static_20260503")
+	}
+}
+
+func TestParsePicoclawVersionOutputNoMeta(t *testing.T) {
+	setupVersionTestIsolation(t)
+
+	raw := "picoclaw v1.0.0\n  Build: 2026-01-01T00:00:00Z\n  Go: go1.25.8\n"
+	got, ok := parsePicoclawVersionOutput(raw)
+	if !ok {
+		t.Fatal("parsePicoclawVersionOutput() should parse valid output")
+	}
+	if got.Version != "v1.0.0" {
+		t.Fatalf("version = %q, want %q", got.Version, "v1.0.0")
+	}
+	if got.GitCommit != "" {
+		t.Fatalf("git_commit = %q, want empty", got.GitCommit)
+	}
+	if got.GitBranch != "" {
+		t.Fatalf("git_branch = %q, want empty", got.GitBranch)
 	}
 }
 
@@ -156,7 +242,7 @@ func TestParsePicoclawVersionOutputIgnoresUsageLine(t *testing.T) {
 func TestParsePicoclawVersionOutputAcceptsLetterOnlyHashVersion(t *testing.T) {
 	setupVersionTestIsolation(t)
 
-	raw := "picoclaw abcdefa (git: abcdefabcdefabcdefabcdefabcdefabcdefabcd)\n"
+	raw := "picoclaw abcdefa (git: abcdefabcdefabcdefabcdefabcdefabcdefabcd, branch: main)\n"
 	got, ok := parsePicoclawVersionOutput(raw)
 	if !ok {
 		t.Fatal("parsePicoclawVersionOutput() should parse letter-only hash version")
@@ -166,6 +252,9 @@ func TestParsePicoclawVersionOutputAcceptsLetterOnlyHashVersion(t *testing.T) {
 	}
 	if got.GitCommit != "abcdefabcdefabcdefabcdefabcdefabcdefabcd" {
 		t.Fatalf("git_commit = %q, want %q", got.GitCommit, "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
+	}
+	if got.GitBranch != "main" {
+		t.Fatalf("git_branch = %q, want %q", got.GitBranch, "main")
 	}
 }
 
@@ -313,5 +402,58 @@ func TestResolveGatewayBinaryForVersionInfoPrefersGatewayCommandPath(t *testing.
 	got := resolveGatewayBinaryForVersionInfo()
 	if got != "/tmp/picoclaw-from-gateway" {
 		t.Fatalf("exec path = %q, want %q", got, "/tmp/picoclaw-from-gateway")
+	}
+}
+
+func TestParseVersionMeta(t *testing.T) {
+	tests := []struct {
+		name           string
+		meta           string
+		wantGitCommit  string
+		wantGitBranch  string
+	}{
+		{
+			name:          "git only",
+			meta:          "git: abc123",
+			wantGitCommit: "abc123",
+			wantGitBranch: "",
+		},
+		{
+			name:          "branch only",
+			meta:          "branch: main",
+			wantGitCommit: "",
+			wantGitBranch: "main",
+		},
+		{
+			name:          "git and branch",
+			meta:          "git: deadbeef, branch: regress/monitoring",
+			wantGitCommit: "deadbeef",
+			wantGitBranch: "regress/monitoring",
+		},
+		{
+			name:          "branch with deep slash",
+			meta:          "git: c739d772, branch: exp/improve_context_static_20260503",
+			wantGitCommit: "c739d772",
+			wantGitBranch: "exp/improve_context_static_20260503",
+		},
+		{
+			name:          "empty",
+			meta:          "",
+			wantGitCommit: "",
+			wantGitBranch: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp systemVersionResponse
+			parseVersionMeta(&resp, tt.meta)
+			if resp.GitCommit != tt.wantGitCommit {
+				t.Errorf("GitCommit = %q, want %q", resp.GitCommit, tt.wantGitCommit)
+			}
+			if resp.GitBranch != tt.wantGitBranch {
+				t.Errorf("GitBranch = %q, want %q", resp.GitBranch, tt.wantGitBranch)
+			}
+		})
 	}
 }

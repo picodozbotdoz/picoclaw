@@ -7,24 +7,70 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestFormatVersion_NoGitCommit(t *testing.T) {
-	oldVersion, oldGit := Version, GitCommit
-	t.Cleanup(func() { Version, GitCommit = oldVersion, oldGit })
+func TestFormatVersion_NoGitCommit_NoGitBranch(t *testing.T) {
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
 
 	Version = "1.2.3"
 	GitCommit = ""
+	GitBranch = ""
 
 	assert.Equal(t, "1.2.3", FormatVersion())
 }
 
 func TestFormatVersion_WithGitCommit(t *testing.T) {
-	oldVersion, oldGit := Version, GitCommit
-	t.Cleanup(func() { Version, GitCommit = oldVersion, oldGit })
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
 
 	Version = "1.2.3"
 	GitCommit = "abc123"
+	GitBranch = ""
 
 	assert.Equal(t, "1.2.3 (git: abc123)", FormatVersion())
+}
+
+func TestFormatVersion_WithGitBranch(t *testing.T) {
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
+
+	Version = "1.2.3"
+	GitCommit = ""
+	GitBranch = "main"
+
+	assert.Equal(t, "1.2.3 (branch: main)", FormatVersion())
+}
+
+func TestFormatVersion_WithGitCommitAndBranch(t *testing.T) {
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
+
+	Version = "1.2.3"
+	GitCommit = "abc123"
+	GitBranch = "regress/monitoring"
+
+	assert.Equal(t, "1.2.3 (git: abc123, branch: regress/monitoring)", FormatVersion())
+}
+
+func TestFormatVersion_DevWithCommitAndBranch(t *testing.T) {
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
+
+	Version = "dev"
+	GitCommit = "deadbeef"
+	GitBranch = "feature/test"
+
+	assert.Equal(t, "dev (git: deadbeef, branch: feature/test)", FormatVersion())
+}
+
+func TestFormatVersion_BranchWithSlash(t *testing.T) {
+	oldVersion, oldGit, oldBranch := Version, GitCommit, GitBranch
+	t.Cleanup(func() { Version, GitCommit, GitBranch = oldVersion, oldGit, oldBranch })
+
+	Version = "v2.0.0"
+	GitCommit = "c739d772"
+	GitBranch = "exp/improve_context_static_20260503"
+
+	assert.Equal(t, "v2.0.0 (git: c739d772, branch: exp/improve_context_static_20260503)", FormatVersion())
 }
 
 func TestFormatBuildInfo_UsesBuildTimeAndGoVersion_WhenSet(t *testing.T) {
@@ -89,4 +135,12 @@ func TestVersion_DefaultIsDev(t *testing.T) {
 	t.Cleanup(func() { Version = oldVersion })
 
 	assert.Equal(t, "dev", Version)
+}
+
+func TestGitBranch_DefaultIsEmpty(t *testing.T) {
+	oldBranch := GitBranch
+	GitBranch = ""
+	t.Cleanup(func() { GitBranch = oldBranch })
+
+	assert.Empty(t, GitBranch)
 }
