@@ -952,6 +952,11 @@ func (c ReadFileToolConfig) EffectiveMode() string {
 type ToolsConfig struct {
         AllowReadPaths  []string `json:"allow_read_paths"  yaml:"-" env:"PICOCLAW_TOOLS_ALLOW_READ_PATHS"`
         AllowWritePaths []string `json:"allow_write_paths" yaml:"-" env:"PICOCLAW_TOOLS_ALLOW_WRITE_PATHS"`
+        // MediaTempDir overrides the directory used for temporary media file storage.
+        // When empty, defaults to os.TempDir()/picoclaw_media (typically /tmp/picoclaw_media).
+        // Setting this to a private directory (e.g. ~/.picoclaw/tmp) prevents other users
+        // from accessing potentially sensitive downloaded media.
+        MediaTempDir string `json:"media_temp_dir" yaml:"-" env:"PICOCLAW_TOOLS_MEDIA_TEMP_DIR"`
         // FilterSensitiveData controls whether to filter sensitive values (API keys,
         // tokens, secrets) from tool results before sending to the LLM.
         // Default: true (enabled)
