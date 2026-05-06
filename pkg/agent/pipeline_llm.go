@@ -342,7 +342,7 @@ func (p *Pipeline) CallLLM(
                         strings.Contains(errMsg, "token limit") ||
                         strings.Contains(errMsg, "too many tokens") ||
                         strings.Contains(errMsg, "max_tokens") ||
-                        strings.Contains(errMsg, "invalidparameter") ||
+                        isInvalidParameterContextError(errMsg) ||
                         strings.Contains(errMsg, "prompt is too long") ||
                         strings.Contains(errMsg, "request too large"))
 
@@ -837,4 +837,27 @@ func validateJSONResponse(content string) bool {
         }
         // Valid JSON: accept both objects and arrays
         return true
+}
+
+// isInvalidParameterContextError checks whether an "InvalidParameter" error
+// is specifically related to context/token overflow rather than a generic
+// format error. This prevents misclassifying format errors (e.g., bad request
+// structure, unsupported parameters) as context overflow, which would trigger
+// unnecessary compression retries.
+//
+// The "InvalidParameter" pattern comes from OpenAI/Azure-style errors like:
+//   "InvalidParameter: Total tokens of image and text exceed max message tokens"
+// Only match when the error also mentions context-related keywords (token,
+// context, length, exceed, limit, window), which indicate a genuine overflow.
+func isInvalidParameterContextError(errMsg string) bool {
+        if !strings.Contains(errMsg, "invalidparameter") {
+                return false
+        }
+        // Must also contain a context/token overflow keyword to qualify
+        return strings.Contains(errMsg, "token") ||
+                strings.Contains(errMsg, "context") ||
+                strings.Contains(errMsg, "length") ||
+                strings.Contains(errMsg, "exceed") ||
+                strings.Contains(errMsg, "limit") ||
+                strings.Contains(errMsg, "window")
 }
