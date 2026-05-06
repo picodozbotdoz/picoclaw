@@ -139,6 +139,13 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                 activeProvider = ts.agent.LightProvider
         }
 
+        // Strip media from assembled context when the active model does not support
+        // vision/image input. After compression, messages may contain image_url content
+        // from prior turns that would be rejected by non-vision models (e.g., ZhipuAI
+        // error code 1210 "API 调用参数有误"). Stripping before the LLM call prevents
+        // the error-retry loop that occurs when the model can't process images.
+        messages = stripMediaForNonVisionModel(messages, activeModel)
+
         exec := newTurnExecution(
                 ts.agent,
                 ts.opts,
