@@ -253,6 +253,7 @@
   "tools": {
     "allow_read_paths": null,
     "allow_write_paths": null,
+    "media_temp_dir": "",
     "web": {
       "enabled": true,
       "prefer_native": true,

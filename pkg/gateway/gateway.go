@@ -377,6 +377,14 @@ func setupAndStartServices(
         }
         fmt.Println("✓ Heartbeat service started")
 
+        // Configure media temp directory before creating the MediaStore.
+        if cfg.Tools.MediaTempDir != "" {
+                media.SetTempDir(cfg.Tools.MediaTempDir)
+                logger.InfoCF("gateway", "media temp directory overridden", map[string]any{
+                        "path": media.TempDir(),
+                })
+        }
+
         runningServices.MediaStore = media.NewFileMediaStoreWithCleanup(media.MediaCleanerConfig{
                 Enabled:  cfg.Tools.MediaCleanup.Enabled,
                 MaxAge:   time.Duration(cfg.Tools.MediaCleanup.MaxAge) * time.Minute,
@@ -653,6 +661,11 @@ func restartServices(
                 return fmt.Errorf("error restarting heartbeat service: %w", err)
         }
         fmt.Println("  ✓ Heartbeat service restarted")
+
+        // Re-configure media temp directory on hot reload.
+        if cfg.Tools.MediaTempDir != "" {
+                media.SetTempDir(cfg.Tools.MediaTempDir)
+        }
 
         runningServices.MediaStore = media.NewFileMediaStoreWithCleanup(media.MediaCleanerConfig{
                 Enabled:  cfg.Tools.MediaCleanup.Enabled,
