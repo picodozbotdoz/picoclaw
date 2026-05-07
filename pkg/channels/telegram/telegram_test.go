@@ -10,6 +10,7 @@ import (
         "strconv"
         "strings"
         "testing"
+        "time"
 
         "github.com/mymmrac/telego"
         ta "github.com/mymmrac/telego/telegoapi"
@@ -2688,4 +2689,500 @@ func TestHandleInlineQuery_WithLocation_RecordsLocationInRaw(t *testing.T) {
 
         assert.Contains(t, inbound.Context.Raw, "location_lat")
         assert.Contains(t, inbound.Context.Raw, "location_lng")
+}
+
+// --- Phase 6 Tests: GAP-8 (Edited Messages), GAP-14 (Channel Posts), GAP-22 (Chat Member) ---
+
+func TestHandleMessage_EditedMessage_SetsIsEditAndEditDate(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Text:      "edited text",
+                MessageID: 100,
+                EditDate:  1700000000,
+                Chat: telego.Chat{
+                        ID:   12345,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        7,
+                        FirstName: "Alice",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg, true)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message")
+
+        assert.True(t, inbound.Context.IsEdit, "IsEdit should be true for edited messages")
+        assert.Equal(t, int64(1700000000), inbound.Context.EditDate, "EditDate should match message EditDate")
+        assert.Equal(t, "edited text", inbound.Content)
+}
+
+func TestHandleMessage_RegularMessage_IsEditFalse(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Text:      "normal message",
+                MessageID: 101,
+                Chat: telego.Chat{
+                        ID:   12345,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        8,
+                        FirstName: "Bob",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message")
+
+        assert.False(t, inbound.Context.IsEdit, "IsEdit should be false for regular messages")
+        assert.Equal(t, int64(0), inbound.Context.EditDate, "EditDate should be 0 for non-edited messages")
+}
+
+func TestHandleMessage_EditedMessage_NoEditDate_ZeroEditDate(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Text:      "edited without date",
+                MessageID: 102,
+                EditDate:  0, // No edit date set
+                Chat: telego.Chat{
+                        ID:   12345,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        9,
+                        FirstName: "Carol",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg, true)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message")
+
+        assert.True(t, inbound.Context.IsEdit, "IsEdit should be true even without EditDate")
+        assert.Equal(t, int64(0), inbound.Context.EditDate, "EditDate should be 0 when message.EditDate is 0")
+}
+
+func TestHandleChannelPost_WithSenderChat_PublishesAsChannelType(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Text:      "Hello from the channel!",
+                MessageID: 200,
+                Chat: telego.Chat{
+                        ID:   -1001234567890,
+                        Type: "channel",
+                },
+                SenderChat: &telego.Chat{
+                        ID:       -1001234567890,
+                        Title:    "My Channel",
+                        Username: "my_channel",
+                },
+        }
+
+        err := ch.handleChannelPost(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message from channel post")
+
+        assert.Equal(t, "channel", inbound.Context.ChatType)
+        assert.Equal(t, "-1001234567890", inbound.Context.ChatID)
+        assert.Equal(t, "200", inbound.Context.MessageID)
+        assert.Equal(t, "Hello from the channel!", inbound.Content)
+        assert.Equal(t, "chat_-1001234567890", inbound.Context.SenderID)
+        assert.Equal(t, "My Channel", inbound.Sender.DisplayName)
+        assert.Equal(t, "my_channel", inbound.Sender.Username)
+        assert.Equal(t, "-1001234567890", inbound.Context.Raw["sender_chat_id"])
+        assert.Equal(t, "My Channel", inbound.Context.Raw["sender_chat_title"])
+}
+
+func TestHandleChannelPost_EmptyText_SkipsPublish(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 201,
+                Chat: telego.Chat{
+                        ID:   -1001234567890,
+                        Type: "channel",
+                },
+        }
+
+        err := ch.handleChannelPost(context.Background(), msg)
+        require.NoError(t, err)
+
+        // Use a non-blocking read: since nothing was published, the channel
+        // should be empty. We use a short timeout to verify this.
+        select {
+        case <-messageBus.InboundChan():
+                t.Fatal("should not publish for empty channel post")
+        case <-time.After(50 * time.Millisecond):
+                // Expected: no message published within the timeout window.
+        }
+}
+
+func TestHandleChannelPost_WithCaption_UsesCaptionAsContent(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Caption:   "Photo from the channel",
+                MessageID: 202,
+                Chat: telego.Chat{
+                        ID:   -1001234567890,
+                        Type: "channel",
+                },
+                SenderChat: &telego.Chat{
+                        ID:    -1001234567890,
+                        Title: "My Channel",
+                },
+        }
+
+        err := ch.handleChannelPost(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message")
+
+        assert.Equal(t, "Photo from the channel", inbound.Content)
+}
+
+func TestHandleChannelPost_NilMessage_ReturnsNil(t *testing.T) {
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, nil, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        err := ch.handleChannelPost(context.Background(), nil)
+        assert.NoError(t, err)
+}
+
+func TestHandleChatMemberUpdated_MyChatMember_PublishesEvent(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        update := &telego.ChatMemberUpdated{
+                Chat: telego.Chat{
+                        ID:   -100999,
+                        Type: "supergroup",
+                },
+                From: telego.User{
+                        ID:        1,
+                        FirstName: "Admin",
+                },
+                Date: 1700000000,
+                OldChatMember: &telego.ChatMemberLeft{
+                        Status: "left",
+                        User:   telego.User{ID: 42, FirstName: "Bot"},
+                },
+                NewChatMember: &telego.ChatMemberMember{
+                        Status: "member",
+                        User:   telego.User{ID: 42, FirstName: "Bot"},
+                },
+        }
+
+        err := ch.handleChatMemberUpdated(context.Background(), update, true)
+        require.NoError(t, err)
+
+        event, ok := <-messageBus.ChatMemberEventsChan()
+        require.True(t, ok, "expected chat member event")
+
+        assert.Equal(t, "telegram", event.Channel)
+        assert.Equal(t, "-100999", event.ChatID)
+        assert.Equal(t, "supergroup", event.ChatType)
+        assert.Equal(t, "1", event.ActorID)
+        assert.Equal(t, "42", event.UserID)
+        assert.Equal(t, "left", event.OldStatus)
+        assert.Equal(t, "member", event.NewStatus)
+        assert.True(t, event.IsMyChatMember)
+        assert.Equal(t, int64(1700000000), event.Date)
+}
+
+func TestHandleChatMemberUpdated_OtherMember_NotMyChatMember(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        update := &telego.ChatMemberUpdated{
+                Chat: telego.Chat{
+                        ID:   -100888,
+                        Type: "group",
+                },
+                From: telego.User{
+                        ID:        1,
+                        FirstName: "Admin",
+                },
+                Date: 1700000001,
+                OldChatMember: &telego.ChatMemberMember{
+                        Status: "member",
+                        User:   telego.User{ID: 99, FirstName: "Alice"},
+                },
+                NewChatMember: &telego.ChatMemberAdministrator{
+                        Status: "administrator",
+                        User:   telego.User{ID: 99, FirstName: "Alice"},
+                },
+        }
+
+        err := ch.handleChatMemberUpdated(context.Background(), update, false)
+        require.NoError(t, err)
+
+        event, ok := <-messageBus.ChatMemberEventsChan()
+        require.True(t, ok, "expected chat member event")
+
+        assert.Equal(t, "-100888", event.ChatID)
+        assert.Equal(t, "99", event.UserID)
+        assert.Equal(t, "member", event.OldStatus)
+        assert.Equal(t, "administrator", event.NewStatus)
+        assert.False(t, event.IsMyChatMember)
+}
+
+func TestHandleChatMemberUpdated_BotAddedToGroup_StoresChatID(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        update := &telego.ChatMemberUpdated{
+                Chat: telego.Chat{
+                        ID:   -100777,
+                        Type: "supergroup",
+                },
+                From: telego.User{
+                        ID:        1,
+                        FirstName: "Admin",
+                },
+                Date: 1700000002,
+                OldChatMember: &telego.ChatMemberLeft{
+                        Status: "left",
+                        User:   telego.User{ID: 42, FirstName: "Bot"},
+                },
+                NewChatMember: &telego.ChatMemberMember{
+                        Status: "member",
+                        User:   telego.User{ID: 42, FirstName: "Bot"},
+                },
+        }
+
+        err := ch.handleChatMemberUpdated(context.Background(), update, true)
+        require.NoError(t, err)
+
+        // Drain the event
+        <-messageBus.ChatMemberEventsChan()
+
+        // Verify the chat ID was stored for the bot
+        assert.Equal(t, int64(-100777), ch.chatIDs["bot"])
+}
+
+func TestHandleChatMemberUpdated_MemberBanned_KickedStatus(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        update := &telego.ChatMemberUpdated{
+                Chat: telego.Chat{
+                        ID:   -100666,
+                        Type: "supergroup",
+                },
+                From: telego.User{
+                        ID:        1,
+                        FirstName: "Admin",
+                },
+                Date: 1700000003,
+                OldChatMember: &telego.ChatMemberMember{
+                        Status: "member",
+                        User:   telego.User{ID: 55, FirstName: "Troll"},
+                },
+                NewChatMember: &telego.ChatMemberBanned{
+                        Status: "kicked",
+                        User:   telego.User{ID: 55, FirstName: "Troll"},
+                },
+        }
+
+        err := ch.handleChatMemberUpdated(context.Background(), update, false)
+        require.NoError(t, err)
+
+        event, ok := <-messageBus.ChatMemberEventsChan()
+        require.True(t, ok)
+
+        assert.Equal(t, "member", event.OldStatus)
+        assert.Equal(t, "kicked", event.NewStatus)
+        assert.Equal(t, "55", event.UserID)
+}
+
+func TestHandleChatMemberUpdated_NilUpdate_ReturnsNil(t *testing.T) {
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, nil, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        err := ch.handleChatMemberUpdated(context.Background(), nil, false)
+        assert.NoError(t, err)
+}
+
+func TestTelegramChatMemberStatus_NilMember(t *testing.T) {
+        assert.Equal(t, "unknown", telegramChatMemberStatus(nil))
+}
+
+func TestTelegramChatMemberStatus_Owner(t *testing.T) {
+        member := &telego.ChatMemberOwner{Status: "creator"}
+        assert.Equal(t, "creator", telegramChatMemberStatus(member))
+}
+
+func TestTelegramChatMemberStatus_Restricted(t *testing.T) {
+        member := &telego.ChatMemberRestricted{Status: "restricted"}
+        assert.Equal(t, "restricted", telegramChatMemberStatus(member))
+}
+
+func TestHandleMessage_EditedMessage_SameSessionAsOriginal(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        // Edited message should use the same chat ID / session as the original.
+        msg := &telego.Message{
+                Text:      "corrected text",
+                MessageID: 103,
+                EditDate:  1700000100,
+                Chat: telego.Chat{
+                        ID:   456,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        10,
+                        FirstName: "Dave",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg, true)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        // Same session key as a non-edited message from the same chat
+        assert.Equal(t, "456", inbound.Context.ChatID)
+        assert.Equal(t, "103", inbound.Context.MessageID)
+        assert.True(t, inbound.Context.IsEdit)
+}
+
+func TestInboundContext_IsEditEditDate_Fields(t *testing.T) {
+        ctx := bus.InboundContext{
+                Channel:  "telegram",
+                ChatID:   "123",
+                SenderID: "456",
+                IsEdit:   true,
+                EditDate: 1700000000,
+        }
+
+        assert.True(t, ctx.IsEdit)
+        assert.Equal(t, int64(1700000000), ctx.EditDate)
+
+        // Verify omitempty behavior
+        ctx2 := bus.InboundContext{
+                Channel:  "telegram",
+                ChatID:   "123",
+                SenderID: "456",
+        }
+        assert.False(t, ctx2.IsEdit)
+        assert.Equal(t, int64(0), ctx2.EditDate)
+}
+
+func TestChatMemberEvent_StructFields(t *testing.T) {
+        event := bus.ChatMemberEvent{
+                Channel:        "telegram",
+                ChatID:         "-100999",
+                ChatType:       "supergroup",
+                ActorID:        "1",
+                UserID:         "42",
+                OldStatus:      "left",
+                NewStatus:      "member",
+                IsMyChatMember: true,
+                Date:           1700000000,
+                Raw: map[string]string{
+                        "actor_id":          "1",
+                        "user_id":           "42",
+                        "old_status":        "left",
+                        "new_status":        "member",
+                        "is_my_chat_member": "true",
+                },
+        }
+
+        assert.Equal(t, "telegram", event.Channel)
+        assert.Equal(t, "-100999", event.ChatID)
+        assert.Equal(t, "supergroup", event.ChatType)
+        assert.Equal(t, "1", event.ActorID)
+        assert.Equal(t, "42", event.UserID)
+        assert.Equal(t, "left", event.OldStatus)
+        assert.Equal(t, "member", event.NewStatus)
+        assert.True(t, event.IsMyChatMember)
+        assert.Equal(t, int64(1700000000), event.Date)
+}
+
+func TestPublishChatMemberEvent_ClosedBus(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        messageBus.Close()
+
+        err := messageBus.PublishChatMemberEvent(bus.ChatMemberEvent{
+                Channel:   "telegram",
+                ChatID:    "-100",
+                OldStatus: "left",
+                NewStatus: "member",
+        })
+        assert.ErrorIs(t, err, bus.ErrBusClosed)
 }

@@ -164,6 +164,24 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
                 return c.handleInlineQuery(ctx, &query)
         })
 
+        // GAP-8: Handle edited messages through the same pipeline with IsEdit flag
+        bh.HandleEditedMessage(func(ctx *th.Context, message telego.Message) error {
+                return c.handleMessage(ctx, &message, true)
+        })
+
+        // GAP-14: Handle channel posts from channels where the bot is admin
+        bh.HandleChannelPost(func(ctx *th.Context, message telego.Message) error {
+                return c.handleChannelPost(ctx, &message)
+        })
+
+        // GAP-22: Track chat member changes for access control and welcome messages
+        bh.HandleMyChatMemberUpdated(func(ctx *th.Context, chatMember telego.ChatMemberUpdated) error {
+                return c.handleChatMemberUpdated(ctx, &chatMember, true)
+        })
+        bh.HandleChatMemberUpdated(func(ctx *th.Context, chatMember telego.ChatMemberUpdated) error {
+                return c.handleChatMemberUpdated(ctx, &chatMember, false)
+        })
+
         c.SetRunning(true)
         logger.InfoCF("telegram", "Telegram bot connected", map[string]any{
                 "username": c.bot.Username(),
@@ -1158,23 +1176,41 @@ func (c *TelegramChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMe
         return messageIDs, nil
 }
 
-func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Message) error {
+func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Message, isEdit ...bool) error {
         if message == nil {
                 return fmt.Errorf("message is nil")
         }
 
+        edited := len(isEdit) > 0 && isEdit[0]
+
+        // For channel posts, the sender may be nil (SenderChat used instead).
+        // We require at least one of From or SenderChat.
         user := message.From
-        if user == nil {
+        if user == nil && message.SenderChat == nil {
                 return fmt.Errorf("message sender (user) is nil")
         }
 
-        platformID := fmt.Sprintf("%d", user.ID)
-        sender := bus.SenderInfo{
-                Platform:    "telegram",
-                PlatformID:  platformID,
-                CanonicalID: identity.BuildCanonicalID("telegram", platformID),
-                Username:    user.Username,
-                DisplayName: user.FirstName,
+        // Build sender info — prefer From (user), fall back to SenderChat (channel).
+        var platformID string
+        var sender bus.SenderInfo
+        if user != nil {
+                platformID = fmt.Sprintf("%d", user.ID)
+                sender = bus.SenderInfo{
+                        Platform:    "telegram",
+                        PlatformID:  platformID,
+                        CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                        Username:    user.Username,
+                        DisplayName: user.FirstName,
+                }
+        } else {
+                platformID = fmt.Sprintf("chat_%d", message.SenderChat.ID)
+                sender = bus.SenderInfo{
+                        Platform:    "telegram",
+                        PlatformID:  platformID,
+                        CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                        Username:    message.SenderChat.Username,
+                        DisplayName: message.SenderChat.Title,
+                }
         }
 
         // check allowlist to avoid downloading attachments for rejected users
@@ -1432,10 +1468,15 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
         messageID := fmt.Sprintf("%d", message.MessageID)
 
         metadata := map[string]string{
-                "user_id":    fmt.Sprintf("%d", user.ID),
-                "username":   user.Username,
-                "first_name": user.FirstName,
                 "is_group":   fmt.Sprintf("%t", message.Chat.Type != "private"),
+        }
+        if user != nil {
+                metadata["user_id"] = fmt.Sprintf("%d", user.ID)
+                metadata["username"] = user.Username
+                metadata["first_name"] = user.FirstName
+        } else if message.SenderChat != nil {
+                metadata["sender_chat_id"] = fmt.Sprintf("%d", message.SenderChat.ID)
+                metadata["sender_chat_title"] = message.SenderChat.Title
         }
 
         inboundCtx := bus.InboundContext{
@@ -1445,7 +1486,11 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
                 SenderID:  platformID,
                 MessageID: messageID,
                 Mentioned: isMentioned,
+                IsEdit:    edited,
                 Raw:       metadata,
+        }
+        if edited && message.EditDate != 0 {
+                inboundCtx.EditDate = int64(message.EditDate)
         }
         if message.Chat.IsForum && threadID != 0 {
                 inboundCtx.TopicID = fmt.Sprintf("%d", threadID)
@@ -1466,6 +1511,154 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
                 sender,
         )
         return nil
+}
+
+// handleChannelPost processes posts from Telegram channels where the bot is
+// an administrator. Channel posts are routed with a "channel" chat type and
+// use one session per channel (not per user). The SenderChat is used as the
+// sender identity since channel posts may not have a From user.
+func (c *TelegramChannel) handleChannelPost(ctx context.Context, message *telego.Message) error {
+        if message == nil {
+                return nil
+        }
+
+        chatID := message.Chat.ID
+
+        logger.InfoCF("telegram", "Received channel post", map[string]any{
+                "chat_id":    chatID,
+                "message_id": message.MessageID,
+                "preview":    utils.Truncate(message.Text, 50),
+        })
+
+        // Channel posts use the channel chat ID as the session key.
+        // This means one session per channel rather than per user.
+        content := message.Text
+        if content == "" && message.Caption != "" {
+                content = message.Caption
+        }
+        if content == "" {
+                return nil
+        }
+
+        // Build sender from SenderChat (the channel itself).
+        chatIDStr := fmt.Sprintf("%d", chatID)
+        var platformID string
+        var sender bus.SenderInfo
+        if message.SenderChat != nil {
+                platformID = fmt.Sprintf("chat_%d", message.SenderChat.ID)
+                sender = bus.SenderInfo{
+                        Platform:    "telegram",
+                        PlatformID:  platformID,
+                        CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                        Username:    message.SenderChat.Username,
+                        DisplayName: message.SenderChat.Title,
+                }
+        } else {
+                platformID = chatIDStr
+                sender = bus.SenderInfo{
+                        Platform:    "telegram",
+                        PlatformID:  platformID,
+                        CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                }
+        }
+
+        metadata := map[string]string{
+                "chat_type": "channel",
+        }
+        if message.SenderChat != nil {
+                metadata["sender_chat_id"] = fmt.Sprintf("%d", message.SenderChat.ID)
+                metadata["sender_chat_title"] = message.SenderChat.Title
+        }
+
+        inboundCtx := bus.InboundContext{
+                Channel:   c.Name(),
+                ChatID:    chatIDStr,
+                ChatType:  "channel",
+                SenderID:  platformID,
+                MessageID: fmt.Sprintf("%d", message.MessageID),
+                Raw:       metadata,
+        }
+
+        c.HandleMessageWithContext(
+                c.ctx,
+                chatIDStr,
+                content,
+                nil,
+                inboundCtx,
+                sender,
+        )
+        return nil
+}
+
+// handleChatMemberUpdated processes chat member status changes (joins, leaves,
+// promotions, etc.). These are administrative events that do not belong to a
+// conversation session. They are logged and published to the bus for consumers
+// that need access control, welcome messages, or group management features.
+func (c *TelegramChannel) handleChatMemberUpdated(ctx context.Context, update *telego.ChatMemberUpdated, isMyChatMember bool) error {
+        if update == nil {
+                return nil
+        }
+
+        chatID := fmt.Sprintf("%d", update.Chat.ID)
+        actorID := fmt.Sprintf("%d", update.From.ID)
+        userID := fmt.Sprintf("%d", update.NewChatMember.MemberUser().ID)
+
+        // Extract the old and new status strings from ChatMember interface.
+        oldStatus := update.OldChatMember.MemberStatus()
+        newStatus := update.NewChatMember.MemberStatus()
+
+        logger.InfoCF("telegram", "Chat member updated", map[string]any{
+                "chat_id":          chatID,
+                "chat_type":        update.Chat.Type,
+                "user_id":          userID,
+                "old_status":        oldStatus,
+                "new_status":        newStatus,
+                "is_my_chat_member": isMyChatMember,
+        })
+
+        event := bus.ChatMemberEvent{
+                Channel:        c.Name(),
+                ChatID:         chatID,
+                ChatType:       update.Chat.Type,
+                ActorID:        actorID,
+                UserID:         userID,
+                OldStatus:      oldStatus,
+                NewStatus:      newStatus,
+                IsMyChatMember: isMyChatMember,
+                Date:           update.Date,
+                Raw: map[string]string{
+                        "actor_id":           actorID,
+                        "user_id":            userID,
+                        "old_status":         oldStatus,
+                        "new_status":         newStatus,
+                        "is_my_chat_member":  fmt.Sprintf("%t", isMyChatMember),
+                },
+        }
+
+        // If the bot itself was added to a group, store the chat ID mapping
+        // so it can respond in that chat later.
+        if isMyChatMember && newStatus == "member" {
+                c.chatIDs["bot"] = update.Chat.ID
+        }
+
+        // Publish the event to the bus for downstream consumers.
+        if bus := c.GetBus(); bus != nil {
+                bus.PublishChatMemberEvent(event)
+        }
+
+        return nil
+}
+
+// telegramChatMemberStatus extracts a human-readable status string from a
+// ChatMember interface. The interface provides MemberStatus() which returns
+// the status string ("creator", "administrator", "member", "restricted",
+// "left", "kicked"). This function is kept for backward compatibility and
+// as a convenience wrapper.
+func telegramChatMemberStatus(member telego.ChatMember) string {
+        if member == nil {
+                return "unknown"
+        }
+        return member.MemberStatus()
 }
 
 func (c *TelegramChannel) prependTelegramQuotedReply(content string, reply *telego.Message) string {
