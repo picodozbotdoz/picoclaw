@@ -48,6 +48,8 @@ var (
         _ channels.ReactionCapable      = (*TelegramChannel)(nil)
         _ channels.CallbackQueryCapable = (*TelegramChannel)(nil)
         _ channels.InlineQueryCapable   = (*TelegramChannel)(nil)
+        _ channels.PinnableCapable      = (*TelegramChannel)(nil)
+        _ channels.BatchMessageDeleter  = (*TelegramChannel)(nil)
 )
 
 type TelegramChannel struct {
@@ -1055,6 +1057,10 @@ func (c *TelegramChannel) SendPlaceholder(ctx context.Context, chatID string) (s
 }
 
 // SendMedia implements the channels.MediaSender interface.
+// GAP-9: Consecutive image/video parts are batched into a media group (album)
+// via sendMediaGroup when there are 2+ items. Single items fall through to
+// individual send calls. Non-file types (sticker, location, venue) are
+// dispatched to dedicated send methods.
 func (c *TelegramChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
         if !c.IsRunning() {
                 return nil, channels.ErrNotRunning
@@ -1067,106 +1073,96 @@ func (c *TelegramChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMe
                 return nil, fmt.Errorf("invalid chat ID %s: %w", msg.ChatID, channels.ErrSendFailed)
         }
 
-        store := c.GetMediaStore()
-        if store == nil {
-                return nil, fmt.Errorf("no media store available: %w", channels.ErrSendFailed)
-        }
-
         var messageIDs []string
-        for _, part := range msg.Parts {
-                localPath, err := store.Resolve(part.Ref)
-                if err != nil {
-                        logger.ErrorCF("telegram", "Failed to resolve media ref", map[string]any{
-                                "ref":   part.Ref,
-                                "error": err.Error(),
-                        })
-                        continue
-                }
 
-                file, err := os.Open(localPath)
-                if err != nil {
-                        logger.ErrorCF("telegram", "Failed to open media file", map[string]any{
-                                "path":  localPath,
-                                "error": err.Error(),
-                        })
-                        continue
-                }
+        // Scan parts list; batch consecutive image/video parts into albums.
+        i := 0
+        for i < len(msg.Parts) {
+                part := msg.Parts[i]
 
-                var tgResult *telego.Message
+                // Handle non-file-based types that don't need the media store.
                 switch part.Type {
-                case "image":
-                        params := &telego.SendPhotoParams{
-                                ChatID:          tu.ID(chatID),
-                                MessageThreadID: threadID,
-                                Photo:           telego.InputFile{File: file},
-                                Caption:         part.Caption,
+                case "location":
+                        mid, sendErr := c.sendLocationPart(ctx, chatID, threadID, part)
+                        if sendErr != nil {
+                                return nil, fmt.Errorf("telegram send location: %w", channels.ErrTemporary)
                         }
-                        tgResult, err = c.bot.SendPhoto(ctx, params)
-                        if err != nil && strings.Contains(err.Error(), "PHOTO_INVALID_DIMENSIONS") {
-                                if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
-                                        file.Close()
-                                        return nil, fmt.Errorf("telegram rewind media after photo failure: %w", channels.ErrTemporary)
-                                }
+                        if mid != "" {
+                                messageIDs = append(messageIDs, mid)
+                        }
+                        i++
+                        continue
+                case "venue":
+                        mid, sendErr := c.sendVenuePart(ctx, chatID, threadID, part)
+                        if sendErr != nil {
+                                return nil, fmt.Errorf("telegram send venue: %w", channels.ErrTemporary)
+                        }
+                        if mid != "" {
+                                messageIDs = append(messageIDs, mid)
+                        }
+                        i++
+                        continue
+                case "sticker":
+                        mid, sendErr := c.sendStickerPart(ctx, chatID, threadID, part)
+                        if sendErr != nil {
+                                return nil, fmt.Errorf("telegram send sticker: %w", channels.ErrTemporary)
+                        }
+                        if mid != "" {
+                                messageIDs = append(messageIDs, mid)
+                        }
+                        i++
+                        continue
+                }
 
-                                docParams := &telego.SendDocumentParams{
-                                        ChatID:          tu.ID(chatID),
-                                        MessageThreadID: threadID,
-                                        Document:        telego.InputFile{File: file},
-                                        Caption:         part.Caption,
-                                }
-                                tgResult, err = c.bot.SendDocument(ctx, docParams)
+                // Try to batch consecutive image/video parts into a media group (GAP-9).
+                if part.Type == "image" || part.Type == "video" {
+                        batchStart := i
+                        for i < len(msg.Parts) && (msg.Parts[i].Type == "image" || msg.Parts[i].Type == "video") {
+                                i++
                         }
-                case "audio":
-                        // Send OGG files with "voice" in the filename as Telegram voice
-                        // bubbles (SendVoice) instead of audio attachments (SendAudio).
-                        fn := strings.ToLower(part.Filename)
-                        if strings.Contains(fn, "voice") && (strings.HasSuffix(fn, ".ogg") || strings.HasSuffix(fn, ".oga")) {
-                                vparams := &telego.SendVoiceParams{
-                                        ChatID:          tu.ID(chatID),
-                                        MessageThreadID: threadID,
-                                        Voice:           telego.InputFile{File: file},
-                                        Caption:         part.Caption,
+                        batch := msg.Parts[batchStart:i]
+                        if len(batch) >= 2 {
+                                // Send as a media group (album).
+                                ids, batchErr := c.sendMediaGroup(ctx, chatID, threadID, batch)
+                                if batchErr != nil {
+                                        // Fallback: send individually on album failure.
+                                        logger.WarnCF("telegram", "Media group failed, sending individually", map[string]any{
+                                                "error": batchErr.Error(),
+                                        })
+                                        for _, p := range batch {
+                                                mid, singleErr := c.sendSingleMediaPart(ctx, chatID, threadID, p)
+                                                if singleErr != nil {
+                                                        return nil, fmt.Errorf("telegram send media: %w", channels.ErrTemporary)
+                                                }
+                                                if mid != "" {
+                                                        messageIDs = append(messageIDs, mid)
+                                                }
+                                        }
+                                } else {
+                                        messageIDs = append(messageIDs, ids...)
                                 }
-                                tgResult, err = c.bot.SendVoice(ctx, vparams)
                         } else {
-                                params := &telego.SendAudioParams{
-                                        ChatID:          tu.ID(chatID),
-                                        MessageThreadID: threadID,
-                                        Audio:           telego.InputFile{File: file},
-                                        Caption:         part.Caption,
+                                // Single image/video — send individually.
+                                mid, singleErr := c.sendSingleMediaPart(ctx, chatID, threadID, batch[0])
+                                if singleErr != nil {
+                                        return nil, fmt.Errorf("telegram send media: %w", channels.ErrTemporary)
                                 }
-                                tgResult, err = c.bot.SendAudio(ctx, params)
+                                if mid != "" {
+                                        messageIDs = append(messageIDs, mid)
+                                }
                         }
-                case "video":
-                        params := &telego.SendVideoParams{
-                                ChatID:          tu.ID(chatID),
-                                MessageThreadID: threadID,
-                                Video:           telego.InputFile{File: file},
-                                Caption:         part.Caption,
-                        }
-                        tgResult, err = c.bot.SendVideo(ctx, params)
-                default: // "file" or unknown types
-                        params := &telego.SendDocumentParams{
-                                ChatID:          tu.ID(chatID),
-                                MessageThreadID: threadID,
-                                Document:        telego.InputFile{File: file},
-                                Caption:         part.Caption,
-                        }
-                        tgResult, err = c.bot.SendDocument(ctx, params)
+                        continue
                 }
 
-                if tgResult != nil {
-                        messageIDs = append(messageIDs, strconv.Itoa(tgResult.MessageID))
-                }
-                file.Close()
-
-                if err != nil {
-                        logger.ErrorCF("telegram", "Failed to send media", map[string]any{
-                                "type":  part.Type,
-                                "error": err.Error(),
-                        })
+                // Default: audio, file, etc.
+                mid, singleErr := c.sendSingleMediaPart(ctx, chatID, threadID, part)
+                if singleErr != nil {
                         return nil, fmt.Errorf("telegram send media: %w", channels.ErrTemporary)
                 }
+                if mid != "" {
+                        messageIDs = append(messageIDs, mid)
+                }
+                i++
         }
 
         if hasTrackedMsg {
@@ -1174,6 +1170,364 @@ func (c *TelegramChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMe
         }
 
         return messageIDs, nil
+}
+
+// sendSingleMediaPart sends a single file-based media part (image, audio,
+// video, file). It resolves the media store ref, opens the file, and
+// dispatches to the appropriate Telegram send method.
+func (c *TelegramChannel) sendSingleMediaPart(ctx context.Context, chatID int64, threadID int, part bus.MediaPart) (string, error) {
+        store := c.GetMediaStore()
+        if store == nil {
+                return "", fmt.Errorf("no media store available")
+        }
+
+        localPath, err := store.Resolve(part.Ref)
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to resolve media ref", map[string]any{
+                        "ref":   part.Ref,
+                        "error": err.Error(),
+                })
+                return "", err
+        }
+
+        file, err := os.Open(localPath)
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to open media file", map[string]any{
+                        "path":  localPath,
+                        "error": err.Error(),
+                })
+                return "", err
+        }
+        defer file.Close()
+
+        var tgResult *telego.Message
+        switch part.Type {
+        case "image":
+                params := &telego.SendPhotoParams{
+                        ChatID:          tu.ID(chatID),
+                        MessageThreadID: threadID,
+                        Photo:           telego.InputFile{File: file},
+                        Caption:         part.Caption,
+                }
+                tgResult, err = c.bot.SendPhoto(ctx, params)
+                if err != nil && strings.Contains(err.Error(), "PHOTO_INVALID_DIMENSIONS") {
+                        if _, seekErr := file.Seek(0, io.SeekStart); seekErr != nil {
+                                return "", fmt.Errorf("telegram rewind media after photo failure: %w", channels.ErrTemporary)
+                        }
+
+                        docParams := &telego.SendDocumentParams{
+                                ChatID:          tu.ID(chatID),
+                                MessageThreadID: threadID,
+                                Document:        telego.InputFile{File: file},
+                                Caption:         part.Caption,
+                        }
+                        tgResult, err = c.bot.SendDocument(ctx, docParams)
+                }
+        case "audio":
+                // Send OGG files with "voice" in the filename as Telegram voice
+                // bubbles (SendVoice) instead of audio attachments (SendAudio).
+                fn := strings.ToLower(part.Filename)
+                if strings.Contains(fn, "voice") && (strings.HasSuffix(fn, ".ogg") || strings.HasSuffix(fn, ".oga")) {
+                        vparams := &telego.SendVoiceParams{
+                                ChatID:          tu.ID(chatID),
+                                MessageThreadID: threadID,
+                                Voice:           telego.InputFile{File: file},
+                                Caption:         part.Caption,
+                        }
+                        tgResult, err = c.bot.SendVoice(ctx, vparams)
+                } else {
+                        params := &telego.SendAudioParams{
+                                ChatID:          tu.ID(chatID),
+                                MessageThreadID: threadID,
+                                Audio:           telego.InputFile{File: file},
+                                Caption:         part.Caption,
+                        }
+                        tgResult, err = c.bot.SendAudio(ctx, params)
+                }
+        case "video":
+                params := &telego.SendVideoParams{
+                        ChatID:          tu.ID(chatID),
+                        MessageThreadID: threadID,
+                        Video:           telego.InputFile{File: file},
+                        Caption:         part.Caption,
+                }
+                tgResult, err = c.bot.SendVideo(ctx, params)
+        default: // "file" or unknown types
+                params := &telego.SendDocumentParams{
+                        ChatID:          tu.ID(chatID),
+                        MessageThreadID: threadID,
+                        Document:        telego.InputFile{File: file},
+                        Caption:         part.Caption,
+                }
+                tgResult, err = c.bot.SendDocument(ctx, params)
+        }
+
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to send media", map[string]any{
+                        "type":  part.Type,
+                        "error": err.Error(),
+                })
+                return "", err
+        }
+
+        if tgResult != nil {
+                return strconv.Itoa(tgResult.MessageID), nil
+        }
+        return "", nil
+}
+
+// sendMediaGroup sends 2-10 image/video parts as a Telegram media group
+// (album) using the sendMediaGroup API. The first item gets the caption;
+// remaining items are sent without captions (Telegram only supports one
+// caption per album).
+func (c *TelegramChannel) sendMediaGroup(ctx context.Context, chatID int64, threadID int, parts []bus.MediaPart) ([]string, error) {
+        store := c.GetMediaStore()
+        if store == nil {
+                return nil, fmt.Errorf("no media store available")
+        }
+
+        var inputMedia []telego.InputMedia
+        // Keep track of open files so we can close them after sending.
+        var files []*os.File
+        defer func() {
+                for _, f := range files {
+                        _ = f.Close()
+                }
+        }()
+
+        for idx, part := range parts {
+                localPath, err := store.Resolve(part.Ref)
+                if err != nil {
+                        return nil, fmt.Errorf("resolve media ref %s: %w", part.Ref, err)
+                }
+
+                file, err := os.Open(localPath)
+                if err != nil {
+                        return nil, fmt.Errorf("open media file %s: %w", localPath, err)
+                }
+                files = append(files, file)
+
+                switch part.Type {
+                case "image":
+                        img := &telego.InputMediaPhoto{
+                                Type:  telego.MediaTypePhoto,
+                                Media: telego.InputFile{File: file},
+                        }
+                        // Only the first item gets the caption.
+                        if idx == 0 && part.Caption != "" {
+                                img.Caption = part.Caption
+                        }
+                        inputMedia = append(inputMedia, img)
+                case "video":
+                        vid := &telego.InputMediaVideo{
+                                Type:  telego.MediaTypeVideo,
+                                Media: telego.InputFile{File: file},
+                        }
+                        if idx == 0 && part.Caption != "" {
+                                vid.Caption = part.Caption
+                        }
+                        inputMedia = append(inputMedia, vid)
+                default:
+                        return nil, fmt.Errorf("unsupported media group part type: %s", part.Type)
+                }
+        }
+
+        params := &telego.SendMediaGroupParams{
+                ChatID:          tu.ID(chatID),
+                MessageThreadID: threadID,
+                Media:           inputMedia,
+        }
+
+        messages, err := c.bot.SendMediaGroup(ctx, params)
+        if err != nil {
+                return nil, err
+        }
+
+        var ids []string
+        for _, m := range messages {
+                ids = append(ids, strconv.Itoa(m.MessageID))
+        }
+        return ids, nil
+}
+
+// sendStickerPart sends a sticker using the Telegram sendSticker API.
+// The Ref field may contain a file_id, a URL, or a media store reference.
+// Stickers are sent as-is without captions (Telegram does not support
+// sticker captions).
+func (c *TelegramChannel) sendStickerPart(ctx context.Context, chatID int64, threadID int, part bus.MediaPart) (string, error) {
+        params := &telego.SendStickerParams{
+                ChatID:          tu.ID(chatID),
+                MessageThreadID: threadID,
+        }
+
+        // Determine if Ref is a URL, a media store reference, or a file_id.
+        ref := part.Ref
+        if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+                params.Sticker = telego.InputFile{URL: ref}
+        } else {
+                // Try as media store reference — resolve to local file.
+                store := c.GetMediaStore()
+                if store != nil {
+                        if localPath, resolveErr := store.Resolve(ref); resolveErr == nil {
+                                file, openErr := os.Open(localPath)
+                                if openErr == nil {
+                                        defer file.Close()
+                                        params.Sticker = telego.InputFile{File: file}
+                                } else {
+                                        params.Sticker = telego.InputFile{FileID: ref}
+                                }
+                        } else {
+                                // Not a media store ref — use as file_id directly.
+                                params.Sticker = telego.InputFile{FileID: ref}
+                        }
+                } else {
+                        params.Sticker = telego.InputFile{FileID: ref}
+                }
+        }
+
+        tgResult, err := c.bot.SendSticker(ctx, params)
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to send sticker", map[string]any{
+                        "ref":   ref,
+                        "error": err.Error(),
+                })
+                return "", err
+        }
+        if tgResult != nil {
+                return strconv.Itoa(tgResult.MessageID), nil
+        }
+        return "", nil
+}
+
+// sendLocationPart sends a location pin using the Telegram sendLocation API.
+func (c *TelegramChannel) sendLocationPart(ctx context.Context, chatID int64, threadID int, part bus.MediaPart) (string, error) {
+        params := &telego.SendLocationParams{
+                ChatID:          tu.ID(chatID),
+                MessageThreadID: threadID,
+                Latitude:        part.Latitude,
+                Longitude:       part.Longitude,
+        }
+
+        tgResult, err := c.bot.SendLocation(ctx, params)
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to send location", map[string]any{
+                        "lat":   part.Latitude,
+                        "lng":   part.Longitude,
+                        "error": err.Error(),
+                })
+                return "", err
+        }
+        if tgResult != nil {
+                return strconv.Itoa(tgResult.MessageID), nil
+        }
+        return "", nil
+}
+
+// sendVenuePart sends a venue (named location) using the Telegram sendVenue API.
+func (c *TelegramChannel) sendVenuePart(ctx context.Context, chatID int64, threadID int, part bus.MediaPart) (string, error) {
+        params := &telego.SendVenueParams{
+                ChatID:          tu.ID(chatID),
+                MessageThreadID: threadID,
+                Latitude:        part.Latitude,
+                Longitude:       part.Longitude,
+                Title:           part.Title,
+                Address:         part.Address,
+        }
+
+        tgResult, err := c.bot.SendVenue(ctx, params)
+        if err != nil {
+                logger.ErrorCF("telegram", "Failed to send venue", map[string]any{
+                        "title":   part.Title,
+                        "address": part.Address,
+                        "error":   err.Error(),
+                })
+                return "", err
+        }
+        if tgResult != nil {
+                return strconv.Itoa(tgResult.MessageID), nil
+        }
+        return "", nil
+}
+
+// PinMessage implements channels.PinnableCapable.
+// It pins a message in the specified chat. The bot must have pin permissions
+// in the target chat. If pinning fails due to insufficient permissions, the
+// error is returned so the caller can decide how to handle it.
+func (c *TelegramChannel) PinMessage(ctx context.Context, chatID string, messageID string) error {
+        cid, _, err := parseTelegramChatID(chatID)
+        if err != nil {
+                return err
+        }
+        mid, err := strconv.Atoi(messageID)
+        if err != nil {
+                return err
+        }
+        return c.bot.PinChatMessage(ctx, &telego.PinChatMessageParams{
+                ChatID:    tu.ID(cid),
+                MessageID: mid,
+        })
+}
+
+// UnpinMessage implements channels.PinnableCapable.
+// It unpins a specific message in the specified chat. The bot must have pin
+// permissions in the target chat.
+func (c *TelegramChannel) UnpinMessage(ctx context.Context, chatID string, messageID string) error {
+        cid, _, err := parseTelegramChatID(chatID)
+        if err != nil {
+                return err
+        }
+        mid, err := strconv.Atoi(messageID)
+        if err != nil {
+                return err
+        }
+        return c.bot.UnpinChatMessage(ctx, &telego.UnpinChatMessageParams{
+                ChatID:    tu.ID(cid),
+                MessageID: mid,
+        })
+}
+
+// DeleteMessages implements channels.BatchMessageDeleter.
+// It deletes multiple messages in a single API call. This is significantly
+// more efficient than calling DeleteMessage individually for each message.
+// Telegram supports deleting up to 100 messages per call; if more than 100
+// IDs are provided, they are batched automatically.
+func (c *TelegramChannel) DeleteMessages(ctx context.Context, chatID string, messageIDs []string) error {
+        if len(messageIDs) == 0 {
+                return nil
+        }
+
+        cid, _, err := parseTelegramChatID(chatID)
+        if err != nil {
+                return err
+        }
+
+        // Convert string IDs to integers.
+        mids := make([]int, 0, len(messageIDs))
+        for _, id := range messageIDs {
+                mid, convErr := strconv.Atoi(id)
+                if convErr != nil {
+                        return fmt.Errorf("invalid message ID %q: %w", id, convErr)
+                }
+                mids = append(mids, mid)
+        }
+
+        // Batch in groups of 100 (Telegram's maximum per call).
+        for batchStart := 0; batchStart < len(mids); batchStart += 100 {
+                batchEnd := batchStart + 100
+                if batchEnd > len(mids) {
+                        batchEnd = len(mids)
+                }
+                batch := mids[batchStart:batchEnd]
+
+                if err = c.bot.DeleteMessages(ctx, &telego.DeleteMessagesParams{
+                        ChatID:     tu.ID(cid),
+                        MessageIDs: batch,
+                }); err != nil {
+                        return err
+                }
+        }
+
+        return nil
 }
 
 func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Message, isEdit ...bool) error {
