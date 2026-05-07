@@ -67,6 +67,13 @@ type AgentInstance struct {
         // LightProvider is the concrete provider instance for the configured light model.
         // It is only used when routing selects the light tier for a turn.
         LightProvider providers.LLMProvider
+        // VisionCandidates holds the resolved provider candidates for the vision model.
+        // Pre-computed at agent creation to avoid repeated model_list lookups at runtime.
+        // When non-nil and image content is detected (via load_image tool), the agent
+        // switches to these candidates for the turn to process the image.
+        VisionCandidates []providers.FallbackCandidate
+        // VisionProvider is the concrete provider instance for the configured vision model.
+        VisionProvider providers.LLMProvider
         // CandidateProviders maps "provider/model" keys to per-candidate LLMProvider
         // instances. This allows each fallback model to use its own api_base and api_key
         // from model_list, instead of inheriting the primary model's provider config.
@@ -340,6 +347,36 @@ func NewAgentInstance(
                 }
         }
 
+        // Vision model routing setup: pre-resolve vision model candidates at creation time
+        // to enable automatic dispatch of image/vision requests to a vision-capable model.
+        var visionCandidates []providers.FallbackCandidate
+        var visionProvider providers.LLMProvider
+        if mc, err := cfg.GetModelConfig(model); err == nil && mc.VisionModel != "" {
+                visionResolved := resolveModelCandidates(cfg, defaults.Provider, mc.VisionModel, nil)
+                if len(visionResolved) > 0 {
+                        visionModelCfg, vErr := resolvedModelConfig(cfg, mc.VisionModel, workspace)
+                        if vErr != nil {
+                                logger.WarnCF("agent", "Vision model config invalid; vision dispatch disabled",
+                                        map[string]any{"vision_model": mc.VisionModel, "agent_id": agentID, "error": vErr.Error()})
+                        } else {
+                                vp, _, vErr := providers.CreateProviderFromConfig(visionModelCfg)
+                                if vErr != nil {
+                                        logger.WarnCF("agent", "Vision model provider init failed; vision dispatch disabled",
+                                                map[string]any{"vision_model": mc.VisionModel, "agent_id": agentID, "error": vErr.Error()})
+                                } else {
+                                        visionCandidates = visionResolved
+                                        visionProvider = vp
+                                        populateCandidateProvidersFromNames(cfg, workspace, []string{mc.VisionModel}, candidateProviders)
+                                        logger.InfoCF("agent", "Vision model dispatch enabled",
+                                                map[string]any{"vision_model": mc.VisionModel, "agent_id": agentID})
+                                }
+                        }
+                } else {
+                        logger.WarnCF("agent", "Vision model not found in model_list; vision dispatch disabled",
+                                map[string]any{"vision_model": mc.VisionModel, "agent_id": agentID})
+                }
+        }
+
         return &AgentInstance{
                 ID:                        agentID,
                 Name:                      agentName,
@@ -374,6 +411,8 @@ func NewAgentInstance(
                 Router:                    router,
                 LightCandidates:           lightCandidates,
                 LightProvider:             lightProvider,
+                VisionCandidates:          visionCandidates,
+                VisionProvider:            visionProvider,
                 CandidateProviders:        candidateProviders,
                 CostTracker:               NewSessionCostTracker(),
                 ExplorationConfig:         defaults.Exploration.Effective(),

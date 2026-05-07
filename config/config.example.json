@@ -47,7 +47,14 @@
     {
       "model_name": "deepseek",
       "model": "deepseek/deepseek-chat",
-      "api_key": "sk-your-deepseek-key"
+      "api_key": "sk-your-deepseek-key",
+      "vision_model": "glm-4v"
+    },
+    {
+      "model_name": "glm-4v",
+      "model": "zhipu/glm-4v-flash",
+      "api_key": "your-zhipu-api-key",
+      "context_window": 131072
     },
     {
       "model_name": "venice-uncensored",
