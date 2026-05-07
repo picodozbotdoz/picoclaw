@@ -892,6 +892,108 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
                 }
         }
 
+        // --- Phase 3: Previously dropped message types ---
+
+        if message.Sticker != nil {
+                emoji := message.Sticker.Emoji
+                if emoji == "" {
+                        emoji = "?"
+                }
+                if content != "" {
+                        content += "\n"
+                }
+                content += fmt.Sprintf("[sticker: %s]", emoji)
+                // Download animated/video stickers as media; static stickers are
+                // small enough that the emoji description is sufficient context.
+                if message.Sticker.IsAnimated || message.Sticker.IsVideo {
+                        stickerPath := c.downloadFile(ctx, message.Sticker.FileID, ".webm")
+                        if stickerPath != "" {
+                                mediaPaths = append(mediaPaths, storeMedia(stickerPath, "sticker.webm"))
+                        }
+                }
+        }
+
+        if message.Video != nil {
+                videoPath := c.downloadFile(ctx, message.Video.FileID, ".mp4")
+                if videoPath != "" {
+                        mediaPaths = append(mediaPaths, storeMedia(videoPath, "video.mp4"))
+                        if content != "" {
+                                content += "\n"
+                        }
+                        content += "[video]"
+                }
+        }
+
+        if message.VideoNote != nil {
+                vnPath := c.downloadFile(ctx, message.VideoNote.FileID, ".mp4")
+                if vnPath != "" {
+                        mediaPaths = append(mediaPaths, storeMedia(vnPath, "video_note.mp4"))
+                        if content != "" {
+                                content += "\n"
+                        }
+                        content += "[video note]"
+                }
+        }
+
+        if message.Animation != nil {
+                animPath := c.downloadFile(ctx, message.Animation.FileID, ".mp4")
+                if animPath != "" {
+                        mediaPaths = append(mediaPaths, storeMedia(animPath, "animation.mp4"))
+                        if content != "" {
+                                content += "\n"
+                        }
+                        content += "[animation]"
+                }
+        }
+
+        if message.Contact != nil {
+                if content != "" {
+                        content += "\n"
+                }
+                contactParts := []string{message.Contact.FirstName}
+                if message.Contact.LastName != "" {
+                        contactParts = append(contactParts, message.Contact.LastName)
+                }
+                name := strings.Join(contactParts, " ")
+                content += fmt.Sprintf("[contact: %s, %s]", name, message.Contact.PhoneNumber)
+        }
+
+        if message.Location != nil {
+                if content != "" {
+                        content += "\n"
+                }
+                content += fmt.Sprintf("[location: %.6f, %.6f]", message.Location.Latitude, message.Location.Longitude)
+        }
+
+        if message.Venue != nil {
+                if content != "" {
+                        content += "\n"
+                }
+                content += fmt.Sprintf("[venue: %s, %s]", message.Venue.Title, message.Venue.Address)
+        }
+
+        if message.Poll != nil {
+                if content != "" {
+                        content += "\n"
+                }
+                optionTexts := make([]string, len(message.Poll.Options))
+                for i, opt := range message.Poll.Options {
+                        optionTexts[i] = opt.Text
+                }
+                pollType := "poll"
+                if message.Poll.Type == "quiz" {
+                        pollType = "quiz"
+                }
+                content += fmt.Sprintf("[%s: %s (%s)]", pollType, message.Poll.Question, strings.Join(optionTexts, " / "))
+        }
+
+        if message.Dice != nil {
+                if content != "" {
+                        content += "\n"
+                }
+                content += fmt.Sprintf("[dice: %s %d]", message.Dice.Emoji, message.Dice.Value)
+        }
+
         if content == "" && len(mediaPaths) == 0 {
                 return nil
         }
@@ -1077,9 +1179,50 @@ func telegramQuotedContent(message *telego.Message) string {
                 parts = append(parts, "[voice]")
         case message.Audio != nil:
                 parts = append(parts, "[audio]")
+        case message.Video != nil:
+                parts = append(parts, "[video]")
+        case message.VideoNote != nil:
+                parts = append(parts, "[video note]")
+        case message.Animation != nil:
+                parts = append(parts, "[animation]")
         }
         if message.Document != nil {
                 parts = append(parts, "[file]")
+        }
+        if message.Sticker != nil {
+                emoji := message.Sticker.Emoji
+                if emoji == "" {
+                        emoji = "?"
+                }
+                parts = append(parts, fmt.Sprintf("[sticker: %s]", emoji))
+        }
+        if message.Contact != nil {
+                contactParts := []string{message.Contact.FirstName}
+                if message.Contact.LastName != "" {
+                        contactParts = append(contactParts, message.Contact.LastName)
+                }
+                name := strings.Join(contactParts, " ")
+                parts = append(parts, fmt.Sprintf("[contact: %s, %s]", name, message.Contact.PhoneNumber))
+        }
+        if message.Location != nil {
+                parts = append(parts, fmt.Sprintf("[location: %.6f, %.6f]", message.Location.Latitude, message.Location.Longitude))
+        }
+        if message.Venue != nil {
+                parts = append(parts, fmt.Sprintf("[venue: %s, %s]", message.Venue.Title, message.Venue.Address))
+        }
+        if message.Poll != nil {
+                optionTexts := make([]string, len(message.Poll.Options))
+                for i, opt := range message.Poll.Options {
+                        optionTexts[i] = opt.Text
+                }
+                pollType := "poll"
+                if message.Poll.Type == "quiz" {
+                        pollType = "quiz"
+                }
+                parts = append(parts, fmt.Sprintf("[%s: %s (%s)]", pollType, message.Poll.Question, strings.Join(optionTexts, " / ")))
+        }
+        if message.Dice != nil {
+                parts = append(parts, fmt.Sprintf("[dice: %s %d]", message.Dice.Emoji, message.Dice.Value))
         }
 
         return strings.Join(parts, "\n")
@@ -1094,6 +1237,15 @@ func quotedTelegramMediaRefs(
         }
 
         var refs []string
+
+        // Photo: download the largest size
+        if len(message.Photo) > 0 {
+                photo := message.Photo[len(message.Photo)-1]
+                if ref := resolve(photo.FileID, ".jpg", "photo.jpg"); ref != "" {
+                        refs = append(refs, ref)
+                }
+        }
+
         if message.Voice != nil {
                 if ref := resolve(message.Voice.FileID, ".ogg", "voice.ogg"); ref != "" {
                         refs = append(refs, ref)
@@ -1104,6 +1256,25 @@ func quotedTelegramMediaRefs(
                         refs = append(refs, ref)
                 }
         }
+        if message.Document != nil {
+                filename := "document"
+                if message.Document.FileName != "" {
+                        filename = message.Document.FileName
+                }
+                if ref := resolve(message.Document.FileID, "", filename); ref != "" {
+                        refs = append(refs, ref)
+                }
+        }
+        if message.Video != nil {
+                filename := "video.mp4"
+                if message.Video.FileName != "" {
+                        filename = message.Video.FileName
+                }
+                if ref := resolve(message.Video.FileID, ".mp4", filename); ref != "" {
+                        refs = append(refs, ref)
+                }
+        }
+
         return refs
 }
 
