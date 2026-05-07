@@ -4,6 +4,7 @@ import (
         "context"
         "encoding/json"
         "errors"
+        "fmt"
         "io"
         "os"
         "path/filepath"
@@ -3185,4 +3186,557 @@ func TestPublishChatMemberEvent_ClosedBus(t *testing.T) {
                 NewStatus: "member",
         })
         assert.ErrorIs(t, err, bus.ErrBusClosed)
+}
+
+// ============================================================================
+// Phase 7: Enhanced Media Features (GAP-9, GAP-10, GAP-11, GAP-12, GAP-13)
+// ============================================================================
+
+// --- GAP-9: Media Group (Album) Support ---
+
+func TestSendMedia_MediaGroup_TwoImages_SendsAsAlbum(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "sendMediaGroup") {
+                                // Return two messages (album of 2 items).
+                                msgs := []telego.Message{
+                                        {MessageID: 101},
+                                        {MessageID: 102},
+                                }
+                                b, err := json.Marshal(msgs)
+                                require.NoError(t, err)
+                                return &ta.Response{Ok: true, Result: b}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        var refs []string
+        for i := 0; i < 2; i++ {
+                path := filepath.Join(tmpDir, fmt.Sprintf("photo%d.jpg", i))
+                require.NoError(t, os.WriteFile(path, []byte("fake-img"), 0o644))
+                ref, err := store.Store(path, media.MediaMeta{Filename: fmt.Sprintf("photo%d.jpg", i)}, "")
+                require.NoError(t, err)
+                refs = append(refs, ref)
+        }
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "image", Ref: refs[0], Caption: "Album caption"},
+                        {Type: "image", Ref: refs[1]},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"101", "102"}, ids)
+
+        // Verify sendMediaGroup was called — the multipart constructor
+        // captures the media field counts. An album of 2 images should
+        // produce at least 2 file uploads in a single call.
+        assert.Equal(t, 1, len(constructor.calls), "expected exactly 1 multipart call (sendMediaGroup)")
+        assert.GreaterOrEqual(t, len(constructor.calls[0].FileSizes), 2, "album should contain 2 files")
+}
+
+func TestSendMedia_MediaGroup_MixedImageAndVideo(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "sendMediaGroup") {
+                                msgs := []telego.Message{
+                                        {MessageID: 201},
+                                        {MessageID: 202},
+                                        {MessageID: 203},
+                                }
+                                b, err := json.Marshal(msgs)
+                                require.NoError(t, err)
+                                return &ta.Response{Ok: true, Result: b}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        var refs []string
+        for i, ext := range []string{".jpg", ".mp4", ".jpg"} {
+                path := filepath.Join(tmpDir, fmt.Sprintf("media%d%s", i, ext))
+                require.NoError(t, os.WriteFile(path, []byte("fake"), 0o644))
+                ref, err := store.Store(path, media.MediaMeta{Filename: fmt.Sprintf("media%d%s", i, ext)}, "")
+                require.NoError(t, err)
+                refs = append(refs, ref)
+        }
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "image", Ref: refs[0]},
+                        {Type: "video", Ref: refs[1]},
+                        {Type: "image", Ref: refs[2]},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"201", "202", "203"}, ids)
+}
+
+func TestSendMedia_MediaGroup_AlbumFailure_FallbackToIndividual(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        callCount := 0
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        callCount++
+                        if strings.Contains(url, "sendMediaGroup") {
+                                // Album call fails.
+                                return nil, errors.New("media group not supported")
+                        }
+                        if strings.Contains(url, "sendPhoto") {
+                                return successResponseWithMessageID(t, 300+callCount), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        var refs []string
+        for i := 0; i < 2; i++ {
+                path := filepath.Join(tmpDir, fmt.Sprintf("photo%d.jpg", i))
+                require.NoError(t, os.WriteFile(path, []byte("fake-img"), 0o644))
+                ref, err := store.Store(path, media.MediaMeta{Filename: fmt.Sprintf("photo%d.jpg", i)}, "")
+                require.NoError(t, err)
+                refs = append(refs, ref)
+        }
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "image", Ref: refs[0]},
+                        {Type: "image", Ref: refs[1]},
+                },
+        })
+        require.NoError(t, err)
+        assert.Len(t, ids, 2)
+}
+
+func TestSendMedia_SingleImage_NotBatchedAsAlbum(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "sendPhoto") {
+                                return successResponseWithMessageID(t, 400), nil
+                        }
+                        t.Fatalf("unexpected API call: %s (expected sendPhoto, not sendMediaGroup)", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        path := filepath.Join(tmpDir, "single.jpg")
+        require.NoError(t, os.WriteFile(path, []byte("fake-img"), 0o644))
+        ref, err := store.Store(path, media.MediaMeta{Filename: "single.jpg"}, "")
+        require.NoError(t, err)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "image", Ref: ref, Caption: "Just one photo"},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"400"}, ids)
+        // Ensure no sendMediaGroup call was made (single image should
+        // go through sendPhoto, not sendMediaGroup).
+        // The caller function already verified sendPhoto was called.
+        // If sendMediaGroup had been used, the caller would have fatalf'd.
+}
+
+func TestSendMedia_ImageThenAudioThenImage_OnlyConsecutiveImagesBatched(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "sendPhoto") {
+                                return successResponseWithMessageID(t, 501), nil
+                        }
+                        if strings.Contains(url, "sendAudio") {
+                                return successResponseWithMessageID(t, 502), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        imgPath := filepath.Join(tmpDir, "photo.jpg")
+        require.NoError(t, os.WriteFile(imgPath, []byte("fake-img"), 0o644))
+        imgRef, err := store.Store(imgPath, media.MediaMeta{Filename: "photo.jpg"}, "")
+        require.NoError(t, err)
+
+        audioPath := filepath.Join(tmpDir, "audio.mp3")
+        require.NoError(t, os.WriteFile(audioPath, []byte("fake-audio"), 0o644))
+        audioRef, err := store.Store(audioPath, media.MediaMeta{Filename: "audio.mp3"}, "")
+        require.NoError(t, err)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "image", Ref: imgRef},
+                        {Type: "audio", Ref: audioRef},
+                        {Type: "image", Ref: imgRef},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"501", "502", "501"}, ids)
+}
+
+// --- GAP-10: Message Pinning (PinnableCapable) ---
+
+func TestPinMessage_Success(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "pinChatMessage")
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.PinMessage(context.Background(), "-100200", "42")
+        assert.NoError(t, err)
+}
+
+func TestUnpinMessage_Success(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "unpinChatMessage")
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.UnpinMessage(context.Background(), "-100200", "42")
+        assert.NoError(t, err)
+}
+
+func TestPinMessage_InvalidChatID(t *testing.T) {
+        caller := &stubCaller{callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+        }}
+        ch := newTestChannel(t, caller)
+
+        err := ch.PinMessage(context.Background(), "not-a-number", "42")
+        assert.Error(t, err)
+}
+
+func TestPinMessage_InvalidMessageID(t *testing.T) {
+        caller := &stubCaller{callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+        }}
+        ch := newTestChannel(t, caller)
+
+        err := ch.PinMessage(context.Background(), "-100200", "abc")
+        assert.Error(t, err)
+}
+
+func TestPinnableCapable_InterfaceAssertion(t *testing.T) {
+        // Verify TelegramChannel implements PinnableCapable at compile time.
+        var _ channels.PinnableCapable = (*TelegramChannel)(nil)
+}
+
+// --- GAP-11: Outbound Sticker Support ---
+
+func TestSendMedia_StickerWithFileID(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "sendSticker")
+                        return successResponseWithMessageID(t, 600), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "sticker", Ref: "CAACAgIAAxkBAAEB"},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"600"}, ids)
+}
+
+func TestSendMedia_StickerWithURL(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "sendSticker")
+                        return successResponseWithMessageID(t, 601), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "sticker", Ref: "https://example.com/sticker.webp"},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"601"}, ids)
+}
+
+func TestSendMedia_StickerWithMediaStoreRef(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "sendSticker")
+                        return successResponseWithMessageID(t, 602), nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        path := filepath.Join(tmpDir, "sticker.webp")
+        require.NoError(t, os.WriteFile(path, []byte("fake-webp"), 0o644))
+        ref, err := store.Store(path, media.MediaMeta{Filename: "sticker.webp"}, "")
+        require.NoError(t, err)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "sticker", Ref: ref},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"602"}, ids)
+}
+
+// --- GAP-12: Location/Venue Outbound Support ---
+
+func TestSendMedia_Location(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "sendLocation")
+                        return successResponseWithMessageID(t, 700), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "location", Latitude: 13.7563, Longitude: 100.5018},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"700"}, ids)
+}
+
+func TestSendMedia_Venue(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "sendVenue")
+                        return successResponseWithMessageID(t, 701), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {
+                                Type:      "venue",
+                                Latitude:  13.7563,
+                                Longitude: 100.5018,
+                                Title:     "Bangkok Office",
+                                Address:   "123 Sukhumvit Rd",
+                        },
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"701"}, ids)
+}
+
+func TestSendMedia_MixedLocationAndImage(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "sendLocation") {
+                                return successResponseWithMessageID(t, 710), nil
+                        }
+                        if strings.Contains(url, "sendPhoto") {
+                                return successResponseWithMessageID(t, 711), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        path := filepath.Join(tmpDir, "photo.jpg")
+        require.NoError(t, os.WriteFile(path, []byte("fake-img"), 0o644))
+        ref, err := store.Store(path, media.MediaMeta{Filename: "photo.jpg"}, "")
+        require.NoError(t, err)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "location", Latitude: 13.7563, Longitude: 100.5018},
+                        {Type: "image", Ref: ref, Caption: "See this place!"},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"710", "711"}, ids)
+}
+
+// --- GAP-13: Batch Message Deletion ---
+
+func TestDeleteMessages_BatchSuccess(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        assert.Contains(t, url, "deleteMessages")
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.DeleteMessages(context.Background(), "-100200", []string{"10", "20", "30"})
+        assert.NoError(t, err)
+}
+
+func TestDeleteMessages_EmptyList_NoAPICall(t *testing.T) {
+        called := false
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        called = true
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.DeleteMessages(context.Background(), "-100200", []string{})
+        assert.NoError(t, err)
+        assert.False(t, called, "no API call should be made for empty message list")
+}
+
+func TestDeleteMessages_InvalidMessageID(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.DeleteMessages(context.Background(), "-100200", []string{"10", "not-a-number"})
+        assert.Error(t, err)
+        assert.Contains(t, err.Error(), "invalid message ID")
+}
+
+func TestDeleteMessages_InvalidChatID(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.DeleteMessages(context.Background(), "not-a-number", []string{"10", "20"})
+        assert.Error(t, err)
+}
+
+func TestBatchMessageDeleter_InterfaceAssertion(t *testing.T) {
+        // Verify TelegramChannel implements BatchMessageDeleter at compile time.
+        var _ channels.BatchMessageDeleter = (*TelegramChannel)(nil)
+}
+
+// --- MediaPart Extended Fields ---
+
+func TestMediaPart_LocationFields(t *testing.T) {
+        part := bus.MediaPart{
+                Type:      "location",
+                Latitude:  13.7563,
+                Longitude: 100.5018,
+        }
+        assert.Equal(t, "location", part.Type)
+        assert.InDelta(t, 13.7563, part.Latitude, 0.0001)
+        assert.InDelta(t, 100.5018, part.Longitude, 0.0001)
+}
+
+func TestMediaPart_VenueFields(t *testing.T) {
+        part := bus.MediaPart{
+                Type:      "venue",
+                Latitude:  13.7563,
+                Longitude: 100.5018,
+                Title:     "Office",
+                Address:   "123 Main St",
+        }
+        assert.Equal(t, "venue", part.Type)
+        assert.Equal(t, "Office", part.Title)
+        assert.Equal(t, "123 Main St", part.Address)
+}
+
+func TestMediaPart_StickerType(t *testing.T) {
+        part := bus.MediaPart{
+                Type: "sticker",
+                Ref:  "CAACAgIAAxkBAAEB",
+        }
+        assert.Equal(t, "sticker", part.Type)
+        assert.Equal(t, "CAACAgIAAxkBAAEB", part.Ref)
+}
+
+func TestSendMedia_StickerLocationAndImage_Combined(t *testing.T) {
+        constructor := &multipartRecordingConstructor{}
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        switch {
+                        case strings.Contains(url, "sendSticker"):
+                                return successResponseWithMessageID(t, 800), nil
+                        case strings.Contains(url, "sendLocation"):
+                                return successResponseWithMessageID(t, 801), nil
+                        case strings.Contains(url, "sendPhoto"):
+                                return successResponseWithMessageID(t, 802), nil
+                        default:
+                                t.Fatalf("unexpected API call: %s", url)
+                                return nil, nil
+                        }
+                },
+        }
+        ch := newTestChannelWithConstructor(t, caller, constructor)
+        store := media.NewFileMediaStore()
+        ch.SetMediaStore(store)
+
+        tmpDir := t.TempDir()
+        imgPath := filepath.Join(tmpDir, "photo.jpg")
+        require.NoError(t, os.WriteFile(imgPath, []byte("fake-img"), 0o644))
+        imgRef, err := store.Store(imgPath, media.MediaMeta{Filename: "photo.jpg"}, "")
+        require.NoError(t, err)
+
+        ids, err := ch.SendMedia(context.Background(), bus.OutboundMediaMessage{
+                ChatID: "-100200",
+                Parts: []bus.MediaPart{
+                        {Type: "sticker", Ref: "CAACAgIAAxkBAAEB"},
+                        {Type: "location", Latitude: 13.7563, Longitude: 100.5018},
+                        {Type: "image", Ref: imgRef, Caption: "Here we are!"},
+                },
+        })
+        require.NoError(t, err)
+        assert.Equal(t, []string{"800", "801", "802"}, ids)
 }

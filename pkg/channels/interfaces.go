@@ -98,3 +98,20 @@ type InlineQueryResult struct {
         URL         string `json:"url,omitempty"`
         ThumbURL    string `json:"thumb_url,omitempty"`
 }
+
+// PinnableCapable is implemented by channels that can pin and unpin messages
+// in chats where the bot has appropriate permissions. Pinned messages are
+// displayed at the top of the chat and are useful for important announcements,
+// instructions, or status updates.
+type PinnableCapable interface {
+        PinMessage(ctx context.Context, chatID string, messageID string) error
+        UnpinMessage(ctx context.Context, chatID string, messageID string) error
+}
+
+// BatchMessageDeleter is implemented by channels that can delete multiple
+// messages in a single API call. This is significantly more efficient than
+// calling DeleteMessage individually for each message when cleaning up
+// streaming drafts, tool feedback messages, or batch operations.
+type BatchMessageDeleter interface {
+        DeleteMessages(ctx context.Context, chatID string, messageIDs []string) error
+}
