@@ -55,6 +55,20 @@ func (r DispatchRequest) SenderID() string {
 	return r.InboundContext.SenderID
 }
 
+func (r DispatchRequest) TopicID() string {
+	if r.InboundContext == nil {
+		return ""
+	}
+	return r.InboundContext.TopicID
+}
+
+func (r DispatchRequest) Raw() map[string]string {
+	if r.InboundContext == nil {
+		return nil
+	}
+	return r.InboundContext.Raw
+}
+
 func normalizeProcessOptionsInPlace(opts *processOptions) {
 	if opts == nil {
 		return

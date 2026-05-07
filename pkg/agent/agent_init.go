@@ -142,6 +142,25 @@ func registerSharedTools(
 				pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer pubCancel()
 				outboundCtx := bus.NewOutboundContext(channel, chatID, replyToMessageID)
+				// Propagate topic/thread ID and raw metadata from the
+				// original inbound context so replies land in the correct
+				// forum topic (or reply thread).
+				callbackTopicID := tools.ToolTopicID(ctx)
+				callbackRaw := tools.ToolRaw(ctx)
+				logger.DebugCF("agent", "message callback context", map[string]any{
+					"topic_id": callbackTopicID,
+					"raw":      callbackRaw,
+					"chat_id":  chatID,
+				})
+				if callbackTopicID != "" {
+					outboundCtx.TopicID = callbackTopicID
+					// Use composite chatID so placeholder and final message
+					// share the same chat key in the manager's tracking maps.
+					outboundCtx.ChatID = chatID + "/" + callbackTopicID
+				}
+				if callbackRaw != nil {
+					outboundCtx.Raw = callbackRaw
+				}
 				outboundAgentID, outboundSessionKey, outboundScope := outboundTurnMetadata(
 					tools.ToolAgentID(ctx),
 					tools.ToolSessionKey(ctx),

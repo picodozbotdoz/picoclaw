@@ -435,6 +435,11 @@ toolLoop:
                         ts.sessionKey,
                         ts.opts.Dispatch.SessionScope,
                 )
+                execCtx = tools.WithToolTopicAndRawContext(
+                        execCtx,
+                        ts.opts.Dispatch.TopicID(),
+                        ts.opts.Dispatch.Raw(),
+                )
                 // WS 4.1: Inject the context store, budget, and workspace path
                 // so context_inject/context_list/context_clear tools can access them.
                 execCtx = tools.WithInjectedContextStore(execCtx, ts.agent.InjectedContext)
