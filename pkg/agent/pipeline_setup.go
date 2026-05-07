@@ -139,12 +139,37 @@ func (p *Pipeline) SetupTurn(ctx context.Context, ts *turnState) (*turnExecution
                 activeProvider = ts.agent.LightProvider
         }
 
+        // Vision model dispatch: when the active model doesn't support vision
+        // but media content is present and a vision model is configured, switch
+        // to the vision model for this turn. This enables non-vision models
+        // (e.g., DeepSeek) to process image uploads by routing to a vision-capable
+        // model (e.g., ZhipuAI GLM-4V) automatically.
+        usedVision := false
+        if len(ts.agent.VisionCandidates) > 0 && ts.agent.VisionProvider != nil &&
+                !isVisionModel(activeModel) && messagesContainMedia(messages) {
+                activeCandidates = ts.agent.VisionCandidates
+                activeModel = ts.agent.VisionProvider.GetDefaultModel()
+                if len(ts.agent.VisionCandidates) > 0 && ts.agent.VisionCandidates[0].Model != "" {
+                        activeModel = ts.agent.VisionCandidates[0].Model
+                }
+                activeProvider = ts.agent.VisionProvider
+                usedVision = true
+                logger.InfoCF("agent", "Vision model dispatch: routing image request to vision model",
+                        map[string]any{
+                                "agent_id":     ts.agent.ID,
+                                "vision_model": activeModel,
+                        })
+        }
+
         // Strip media from assembled context when the active model does not support
         // vision/image input. After compression, messages may contain image_url content
         // from prior turns that would be rejected by non-vision models (e.g., ZhipuAI
         // error code 1210 "API 调用参数有误"). Stripping before the LLM call prevents
         // the error-retry loop that occurs when the model can't process images.
-        messages = stripMediaForNonVisionModel(messages, activeModel)
+        // Skip stripping when using a vision model dispatch.
+        if !usedVision {
+                messages = stripMediaForNonVisionModel(messages, activeModel)
+        }
 
         exec := newTurnExecution(
                 ts.agent,

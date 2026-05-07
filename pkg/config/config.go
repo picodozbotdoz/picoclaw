@@ -719,6 +719,12 @@ type ModelConfig struct {
         // existing configs, the field is inferred during load: models with API keys
         // or the reserved "local-model" name are auto-enabled.
         Enabled bool `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+        // VisionModel is the model_name (from model_list) of a vision-capable model
+        // that should handle image/vision requests when this primary model doesn't
+        // support vision natively. When set and the agent detects image content
+        // (via load_image tool or channel attachments), it switches to this model
+        // for that turn to process the image, then switches back for subsequent turns.
+        VisionModel string `json:"vision_model,omitempty" yaml:"vision_model,omitempty"`
         // UserAgent is the user agent string to use for HTTP requests.
         UserAgent string `json:"user_agent,omitempty" yaml:"-"`
 
