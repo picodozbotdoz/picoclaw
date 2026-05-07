@@ -1360,3 +1360,545 @@ func TestTelegramChannel_ImplementsReactionCapable(t *testing.T) {
         // This runtime test confirms the wiring is correct.
         var _ channels.ReactionCapable = (*TelegramChannel)(nil)
 }
+
+// --- Phase 3 Tests: Inbound Media Completeness ---
+
+func TestHandleMessage_Sticker_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 60,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Sticker: &telego.Sticker{
+                        FileID:     "sticker_abc",
+                        Emoji:      "🎉",
+                        IsAnimated: false,
+                        IsVideo:    false,
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "sticker message should produce inbound content")
+
+        assert.Contains(t, inbound.Content, "[sticker: 🎉]")
+        // Static sticker should NOT add media (emoji description is sufficient)
+        assert.Empty(t, inbound.Media)
+}
+
+func TestHandleMessage_Sticker_Animated_DownloadsMedia(t *testing.T) {
+        // Use a mock bot that returns an empty file for getFile requests,
+        // so the download attempt doesn't panic but also doesn't produce media.
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "getFile") {
+                                file := &telego.File{FileID: "anim_sticker_abc"}
+                                b, _ := json.Marshal(file)
+                                return &ta.Response{Ok: true, Result: b}, nil
+                        }
+                        return &ta.Response{Ok: true, Result: json.RawMessage(`true`)}, nil
+                },
+        }
+        messageBus := bus.NewMessageBus()
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        msg := &telego.Message{
+                MessageID: 61,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Sticker: &telego.Sticker{
+                        FileID:     "anim_sticker_abc",
+                        Emoji:      "👍",
+                        IsAnimated: true,
+                        IsVideo:    false,
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[sticker: 👍]")
+        // Animated sticker attempts a download; since the mock returns no FilePath,
+        // download fails gracefully and no media ref is added — content is still present.
+}
+
+func TestHandleMessage_Sticker_NoEmoji_UsesFallback(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 62,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Sticker: &telego.Sticker{
+                        FileID: "sticker_noemoji",
+                        Emoji:  "", // no emoji
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[sticker: ?]")
+}
+
+func TestHandleMessage_Contact_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 63,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Contact: &telego.Contact{
+                        PhoneNumber: "+1234567890",
+                        FirstName:   "John",
+                        LastName:    "Doe",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[contact: John Doe, +1234567890]")
+}
+
+func TestHandleMessage_Contact_NoLastName(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 64,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Contact: &telego.Contact{
+                        PhoneNumber: "+9876543210",
+                        FirstName:   "Jane",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[contact: Jane, +9876543210]")
+}
+
+func TestHandleMessage_Location_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 65,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Location: &telego.Location{
+                        Latitude:  13.756331,
+                        Longitude: 100.501765,
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[location:")
+        assert.Contains(t, inbound.Content, "13.756331")
+        assert.Contains(t, inbound.Content, "100.501765")
+}
+
+func TestHandleMessage_Venue_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 66,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Venue: &telego.Venue{
+                        Location: telego.Location{Latitude: 40.7128, Longitude: -74.0060},
+                        Title:    "Central Park",
+                        Address:  "New York, NY",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[venue: Central Park, New York, NY]")
+}
+
+func TestHandleMessage_Poll_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 67,
+                Chat: telego.Chat{
+                        ID:   -100999,
+                        Type: "supergroup",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Poll: &telego.Poll{
+                        ID:       "poll1",
+                        Question: "What time?",
+                        Options: []telego.PollOption{
+                                {Text: "9am"},
+                                {Text: "10am"},
+                                {Text: "11am"},
+                        },
+                        Type: "regular",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[poll: What time? (9am / 10am / 11am)]")
+}
+
+func TestHandleMessage_Poll_QuizType(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 68,
+                Chat: telego.Chat{
+                        ID:   -100999,
+                        Type: "supergroup",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Poll: &telego.Poll{
+                        ID:       "quiz1",
+                        Question: "Capital of France?",
+                        Options: []telego.PollOption{
+                                {Text: "London"},
+                                {Text: "Paris"},
+                        },
+                        Type: "quiz",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[quiz: Capital of France? (London / Paris)]")
+}
+
+func TestHandleMessage_Dice_ProducesContentAnnotation(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                MessageID: 69,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Dice: &telego.Dice{
+                        Emoji: "🎲",
+                        Value: 5,
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "[dice: 🎲 5]")
+}
+
+func TestHandleMessage_TextAndSticker_BothAnnotations(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        msg := &telego.Message{
+                Text:      "nice one!",
+                MessageID: 70,
+                Chat: telego.Chat{
+                        ID:   100,
+                        Type: "private",
+                },
+                From: &telego.User{
+                        ID:        11,
+                        FirstName: "Alice",
+                },
+                Sticker: &telego.Sticker{
+                        FileID: "sticker_xyz",
+                        Emoji:  "🔥",
+                },
+        }
+
+        err := ch.handleMessage(context.Background(), msg)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+
+        assert.Contains(t, inbound.Content, "nice one!")
+        assert.Contains(t, inbound.Content, "[sticker: 🔥]")
+}
+
+// --- Phase 3: telegramQuotedContent tests ---
+
+func TestTelegramQuotedContent_IncludesSticker(t *testing.T) {
+        msg := &telego.Message{
+                Sticker: &telego.Sticker{Emoji: "😎"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[sticker: 😎]")
+}
+
+func TestTelegramQuotedContent_IncludesVideo(t *testing.T) {
+        msg := &telego.Message{
+                Video: &telego.Video{FileID: "vid1"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[video]")
+}
+
+func TestTelegramQuotedContent_IncludesVideoNote(t *testing.T) {
+        msg := &telego.Message{
+                VideoNote: &telego.VideoNote{FileID: "vn1"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[video note]")
+}
+
+func TestTelegramQuotedContent_IncludesAnimation(t *testing.T) {
+        msg := &telego.Message{
+                Animation: &telego.Animation{FileID: "anim1"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[animation]")
+}
+
+func TestTelegramQuotedContent_IncludesContact(t *testing.T) {
+        msg := &telego.Message{
+                Contact: &telego.Contact{FirstName: "Jane", LastName: "Smith", PhoneNumber: "+111"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[contact: Jane Smith, +111]")
+}
+
+func TestTelegramQuotedContent_IncludesLocation(t *testing.T) {
+        msg := &telego.Message{
+                Location: &telego.Location{Latitude: 1.234, Longitude: 5.678},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[location:")
+}
+
+func TestTelegramQuotedContent_IncludesVenue(t *testing.T) {
+        msg := &telego.Message{
+                Venue: &telego.Venue{Title: "Cafe", Address: "123 St"},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[venue: Cafe, 123 St]")
+}
+
+func TestTelegramQuotedContent_IncludesPoll(t *testing.T) {
+        msg := &telego.Message{
+                Poll: &telego.Poll{
+                        Question: "Pick one",
+                        Options:  []telego.PollOption{{Text: "A"}, {Text: "B"}},
+                        Type:     "regular",
+                },
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[poll: Pick one (A / B)]")
+}
+
+func TestTelegramQuotedContent_IncludesDice(t *testing.T) {
+        msg := &telego.Message{
+                Dice: &telego.Dice{Emoji: "🎯", Value: 3},
+        }
+        content := telegramQuotedContent(msg)
+        assert.Contains(t, content, "[dice: 🎯 3]")
+}
+
+// --- Phase 3: quotedTelegramMediaRefs tests ---
+
+func TestQuotedTelegramMediaRefs_IncludesPhoto(t *testing.T) {
+        msg := &telego.Message{
+                Photo: []telego.PhotoSize{
+                        {FileID: "small", Width: 90, Height: 90},
+                        {FileID: "large", Width: 800, Height: 600},
+                },
+        }
+        var resolved []string
+        refs := quotedTelegramMediaRefs(msg, func(fileID, ext, filename string) string {
+                resolved = append(resolved, fileID)
+                return "ref:" + fileID
+        })
+        assert.Contains(t, resolved, "large", "should download largest photo size")
+        assert.Equal(t, "ref:large", refs[0])
+}
+
+func TestQuotedTelegramMediaRefs_IncludesDocument(t *testing.T) {
+        msg := &telego.Message{
+                Document: &telego.Document{FileID: "doc123", FileName: "report.pdf"},
+        }
+        var resolved []string
+        refs := quotedTelegramMediaRefs(msg, func(fileID, ext, filename string) string {
+                resolved = append(resolved, fileID)
+                return "ref:" + fileID
+        })
+        assert.Contains(t, resolved, "doc123")
+        assert.Equal(t, "ref:doc123", refs[0])
+}
+
+func TestQuotedTelegramMediaRefs_IncludesVideo(t *testing.T) {
+        msg := &telego.Message{
+                Video: &telego.Video{FileID: "vid456", FileName: "clip.mp4"},
+        }
+        var resolved []string
+        refs := quotedTelegramMediaRefs(msg, func(fileID, ext, filename string) string {
+                resolved = append(resolved, fileID)
+                return "ref:" + fileID
+        })
+        assert.Contains(t, resolved, "vid456")
+        assert.Equal(t, "ref:vid456", refs[0])
+}
+
+func TestQuotedTelegramMediaRefs_AllTypesInOrder(t *testing.T) {
+        msg := &telego.Message{
+                Photo: []telego.PhotoSize{
+                        {FileID: "photo1", Width: 800, Height: 600},
+                },
+                Voice:    &telego.Voice{FileID: "voice1"},
+                Audio:    &telego.Audio{FileID: "audio1"},
+                Document: &telego.Document{FileID: "doc1"},
+                Video:    &telego.Video{FileID: "vid1"},
+        }
+        var order []string
+        refs := quotedTelegramMediaRefs(msg, func(fileID, ext, filename string) string {
+                order = append(order, fileID)
+                return "ref:" + fileID
+        })
+        require.Len(t, refs, 5)
+        // Order: photo, voice, audio, document, video
+        assert.Equal(t, []string{"photo1", "voice1", "audio1", "doc1", "vid1"}, order)
+}
