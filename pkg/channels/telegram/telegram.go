@@ -2,6 +2,7 @@ package telegram
 
 import (
         "context"
+	"encoding/json"
         "crypto/rand"
         "encoding/binary"
         "errors"
@@ -10,6 +11,7 @@ import (
         "net/http"
         "net/url"
         "os"
+	"path/filepath"
         "regexp"
         "strconv"
         "strings"
@@ -62,6 +64,7 @@ type TelegramChannel struct {
         cancel   context.CancelFunc
         tgCfg    *config.TelegramSettings
         progress *channels.ToolFeedbackAnimator
+        logStore *TGLogStore
 
         registerFunc      func(context.Context, []commands.Definition) error
         commandRegDelayFn func(int) time.Duration
@@ -130,6 +133,15 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
         logger.InfoC("telegram", "Starting Telegram bot (polling mode)...")
 
         c.ctx, c.cancel = context.WithCancel(ctx)
+
+        // Initialize TG log store for raw message debugging
+        logDBPath := filepath.Join(os.Getenv("HOME"), ".picoclaw", "tg_log.db")
+        if store, err := NewTGLogStore(logDBPath); err == nil {
+                c.logStore = store
+        } else {
+                logger.WarnCF("telegram", "Failed to create TG log store", map[string]any{"error": err.Error()})
+        }
+
 
         updates, err := c.bot.UpdatesViaLongPolling(c.ctx, &telego.GetUpdatesParams{
                 Timeout: 30,
@@ -417,6 +429,17 @@ func (c *TelegramChannel) sendChunk(
                 }
         }
 
+        // Log outbound message if enabled
+        if c.logStore != nil && pMsg != nil {
+        	rawJSON, _ := json.Marshal(pMsg)
+        	c.logStore.LogOutgoing(
+        		fmt.Sprintf("%d", params.chatID),
+        		fmt.Sprintf("%d", pMsg.MessageID),
+        		fmt.Sprintf("%d", params.threadID),
+        		utils.Truncate(params.content, 100),
+        		rawJSON,
+        	)
+        }
         return strconv.Itoa(pMsg.MessageID), nil
 }
 
@@ -1828,6 +1851,34 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
                 "thread_id": threadID,
                 "preview":   utils.Truncate(content, 50),
         })
+        // Raw message logging for debugging (toggled via /tg.log= commands)
+        if c.logStore != nil {
+        	rawJSON, _ := json.Marshal(message)
+        	c.logStore.LogIncoming(
+        		compositeChatID,
+        		fmt.Sprintf("%d", message.MessageID),
+        		fmt.Sprintf("%d", threadID),
+        		utils.Truncate(content, 100),
+        		rawJSON,
+        		"",
+        	)
+        }
+
+        // Handle /tg.log= command to toggle raw message logging
+        if strings.HasPrefix(content, "/tg.log=") {
+                val := strings.TrimPrefix(content, "/tg.log=")
+                val = strings.TrimSpace(val)
+                if val == "true" || val == "1" {
+                        if c.logStore != nil {
+                                c.logStore.SetEnabled(true)
+                        }
+                } else if val == "false" || val == "0" {
+                        if c.logStore != nil {
+                                c.logStore.SetEnabled(false)
+                        }
+                }
+                return nil
+        }
 
         peerKind := "direct"
         if message.Chat.Type != "private" {
