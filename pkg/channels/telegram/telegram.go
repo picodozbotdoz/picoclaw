@@ -1822,7 +1822,10 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
         messageID := fmt.Sprintf("%d", message.MessageID)
 
         metadata := map[string]string{
-                "is_group":   fmt.Sprintf("%t", message.Chat.Type != "private"),
+                "is_group": fmt.Sprintf("%t", message.Chat.Type != "private"),
+        }
+        if threadID != 0 {
+                metadata["thread_id"] = fmt.Sprintf("%d", threadID)
         }
         if user != nil {
                 metadata["user_id"] = fmt.Sprintf("%d", user.ID)
@@ -2332,12 +2335,20 @@ func resolveTelegramOutboundTarget(chatID string, outboundCtx *bus.InboundContex
         if resolvedThreadID != 0 || outboundCtx == nil {
                 return resolvedChatID, resolvedThreadID, nil
         }
+        // Check TopicID first (forum topics)
         topicID := strings.TrimSpace(outboundCtx.TopicID)
-        if topicID == "" {
-                return resolvedChatID, resolvedThreadID, nil
+        if topicID != "" {
+                if tid, convErr := strconv.Atoi(topicID); convErr == nil {
+                        return resolvedChatID, tid, nil
+                }
         }
-        if threadID, convErr := strconv.Atoi(topicID); convErr == nil {
-                return resolvedChatID, threadID, nil
+        // Fallback: check raw metadata for thread_id (non-forum reply threads)
+        if outboundCtx.Raw != nil {
+                if rawTID, ok := outboundCtx.Raw["thread_id"]; ok && rawTID != "" {
+                        if tid, convErr := strconv.Atoi(rawTID); convErr == nil {
+                                return resolvedChatID, tid, nil
+                        }
+                }
         }
         return resolvedChatID, resolvedThreadID, nil
 }

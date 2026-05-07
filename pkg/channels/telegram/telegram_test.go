@@ -737,6 +737,76 @@ func TestSend_UsesContextTopicIDWhenChatIDDoesNotIncludeThread(t *testing.T) {
         assert.Equal(t, "Hello from topic context", params.Text)
 }
 
+func TestSend_UsesRawThreadIDFallbackWhenTopicIDEmpty(t *testing.T) {
+        // When TopicID is empty but raw metadata has "thread_id",
+        // the outbound should still route to the correct thread.
+        // This handles non-forum reply threads (e.g. private chat threads).
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        return successResponse(t), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        _, err := ch.Send(context.Background(), bus.OutboundMessage{
+                ChatID:  "7479477860",
+                Content: "Hello from thread fallback",
+                Context: bus.InboundContext{
+                        Channel: "telegram",
+                        ChatID:  "7479477860",
+                        Raw: map[string]string{
+                                "thread_id": "3004",
+                        },
+                },
+        })
+
+        require.NoError(t, err)
+        require.Len(t, caller.calls, 1)
+
+        var params struct {
+                ChatID          int64  `json:"chat_id"`
+                MessageThreadID int    `json:"message_thread_id"`
+                Text            string `json:"text"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+        assert.Equal(t, int64(7479477860), params.ChatID)
+        assert.Equal(t, 3004, params.MessageThreadID)
+        assert.Equal(t, "Hello from thread fallback", params.Text)
+}
+
+func TestSend_TopicIDTakesPrecedenceOverRawThreadID(t *testing.T) {
+        // TopicID should take precedence over raw thread_id
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        return successResponse(t), nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        _, err := ch.Send(context.Background(), bus.OutboundMessage{
+                ChatID:  "-1001234567890",
+                Content: "TopicID takes precedence",
+                Context: bus.InboundContext{
+                        Channel: "telegram",
+                        ChatID:  "-1001234567890",
+                        TopicID: "42",
+                        Raw: map[string]string{
+                                "thread_id": "99",
+                        },
+                },
+        })
+
+        require.NoError(t, err)
+        require.Len(t, caller.calls, 1)
+
+        var params struct {
+                ChatID          int64  `json:"chat_id"`
+                MessageThreadID int    `json:"message_thread_id"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+        assert.Equal(t, 42, params.MessageThreadID, "TopicID should take precedence over raw thread_id")
+}
+
 func TestBeginStream_UpdateUsesForumThreadID(t *testing.T) {
         caller := &stubCaller{
                 callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
