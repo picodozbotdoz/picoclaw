@@ -237,6 +237,15 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]
                 return nil, fmt.Errorf("invalid chat ID %s: %w", msg.ChatID, channels.ErrSendFailed)
         }
 
+        logger.DebugCF("telegram", "Send resolved target", map[string]any{
+                "msg_chat_id":   msg.ChatID,
+                "ctx_chat_id":   msg.Context.ChatID,
+                "ctx_topic_id":  msg.Context.TopicID,
+                "ctx_raw":       msg.Context.Raw,
+                "resolved_chat": chatID,
+                "resolved_thr":  threadID,
+        })
+
         if msg.Content == "" {
                 return nil, nil
         }
@@ -375,6 +384,11 @@ func (c *TelegramChannel) sendChunk(
         ctx context.Context,
         params sendChunkParams,
 ) (string, error) {
+        logger.DebugCF("telegram", "sendChunk params", map[string]any{
+                "chat_id":   params.chatID,
+                "thread_id": params.threadID,
+                "preview":   utils.Truncate(params.content, 40),
+        })
         tgMsg := tu.Message(tu.ID(params.chatID), params.content)
         tgMsg.MessageThreadID = params.threadID
         if params.useMarkdownV2 {
@@ -1804,7 +1818,7 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
         // must share one session per group.
         compositeChatID := fmt.Sprintf("%d", chatID)
         threadID := message.MessageThreadID
-        if message.Chat.IsForum && threadID != 0 {
+        if threadID != 0 {
                 compositeChatID = fmt.Sprintf("%d/%d", chatID, threadID)
         }
 
@@ -1838,7 +1852,7 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
 
         inboundCtx := bus.InboundContext{
                 Channel:   c.Name(),
-                ChatID:    fmt.Sprintf("%d", chatID),
+                ChatID:    compositeChatID,
                 ChatType:  peerKind,
                 SenderID:  platformID,
                 MessageID: messageID,
@@ -1849,7 +1863,7 @@ func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Mes
         if edited && message.EditDate != 0 {
                 inboundCtx.EditDate = int64(message.EditDate)
         }
-        if message.Chat.IsForum && threadID != 0 {
+        if threadID != 0 {
                 inboundCtx.TopicID = fmt.Sprintf("%d", threadID)
         }
         if message.ReplyToMessage != nil {

@@ -89,6 +89,22 @@ func ToolSessionScope(ctx context.Context) *session.SessionScope {
 	return toolshared.ToolSessionScope(ctx)
 }
 
+func WithToolTopicAndRawContext(
+	ctx context.Context,
+	topicID string,
+	raw map[string]string,
+) context.Context {
+	return toolshared.WithToolTopicAndRawContext(ctx, topicID, raw)
+}
+
+func ToolTopicID(ctx context.Context) string {
+	return toolshared.ToolTopicID(ctx)
+}
+
+func ToolRaw(ctx context.Context) map[string]string {
+	return toolshared.ToolRaw(ctx)
+}
+
 func ToolToSchema(tool Tool) map[string]any {
 	return toolshared.ToolToSchema(tool)
 }

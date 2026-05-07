@@ -50,6 +50,8 @@ var (
 	ctxKeyAgentID          = &toolCtxKey{"agentID"}
 	ctxKeySessionKey       = &toolCtxKey{"sessionKey"}
 	ctxKeySessionScope     = &toolCtxKey{"sessionScope"}
+	ctxKeyTopicID          = &toolCtxKey{"topicID"}
+	ctxKeyRaw              = &toolCtxKey{"raw"}
 )
 
 // WithToolContext returns a child context carrying channel and chatID.
@@ -73,6 +75,17 @@ func WithToolInboundContext(
 ) context.Context {
 	ctx = WithToolContext(ctx, channel, chatID)
 	ctx = WithToolMessageContext(ctx, messageID, replyToMessageID)
+	return ctx
+}
+
+// WithToolTopicAndRawContext returns a child context carrying topic/thread ID and raw metadata.
+func WithToolTopicAndRawContext(
+	ctx context.Context,
+	topicID string,
+	raw map[string]string,
+) context.Context {
+	ctx = context.WithValue(ctx, ctxKeyTopicID, topicID)
+	ctx = context.WithValue(ctx, ctxKeyRaw, raw)
 	return ctx
 }
 
@@ -128,6 +141,18 @@ func ToolSessionKey(ctx context.Context) string {
 func ToolSessionScope(ctx context.Context) *session.SessionScope {
 	scope, _ := ctx.Value(ctxKeySessionScope).(*session.SessionScope)
 	return session.CloneScope(scope)
+}
+
+// ToolTopicID extracts the topic/thread ID from ctx, or "" if unset.
+func ToolTopicID(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyTopicID).(string)
+	return v
+}
+
+// ToolRaw extracts the raw metadata map from ctx, or nil if unset.
+func ToolRaw(ctx context.Context) map[string]string {
+	v, _ := ctx.Value(ctxKeyRaw).(map[string]string)
+	return v
 }
 
 // AsyncCallback is a function type that async tools use to notify completion.
