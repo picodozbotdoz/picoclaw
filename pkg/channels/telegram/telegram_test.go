@@ -2421,3 +2421,271 @@ func TestHandleCallbackQuery_ForumWithoutThread_NoCompositeChatID(t *testing.T) 
         assert.Equal(t, "-100777", inbound.Context.ChatID)
         assert.Empty(t, inbound.Context.TopicID)
 }
+
+// --- Inline Query Tests ---
+
+func TestHandleInlineQuery_Disabled_ReturnsEmptyResults(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        // EnableInline is false by default
+
+        query := &telego.InlineQuery{
+                ID:   "test-query-1",
+                From: telego.User{ID: 42, FirstName: "Alice", Username: "alice"},
+                Query: "hello",
+        }
+
+        err := ch.handleInlineQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Should have called answerInlineQuery with empty results
+        require.Len(t, caller.calls, 1)
+        assert.Contains(t, caller.calls[0].URL, "answerInlineQuery")
+
+        var params struct {
+                InlineQueryID string `json:"inline_query_id"`
+                Results       []any  `json:"results"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+        assert.Equal(t, "test-query-1", params.InlineQueryID)
+        assert.Empty(t, params.Results, "disabled inline mode should return empty results")
+}
+
+func TestHandleInlineQuery_Enabled_NilQuery_ReturnsNil(t *testing.T) {
+        ch := newTestChannel(t, &stubCaller{})
+        ch.tgCfg.EnableInline = true
+
+        err := ch.handleInlineQuery(context.Background(), nil)
+        assert.NoError(t, err)
+}
+
+func TestHandleInlineQuery_Enabled_EmptyQuery_ReturnsHelpArticle(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        if strings.Contains(url, "getMe") {
+                                return successUserResponse(t, &telego.User{
+                                        ID:       123,
+                                        IsBot:    true,
+                                        Username: "testbot",
+                                }), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.tgCfg.EnableInline = true
+
+        query := &telego.InlineQuery{
+                ID:    "test-query-2",
+                From:  telego.User{ID: 42, FirstName: "Alice"},
+                Query: "",
+        }
+
+        err := ch.handleInlineQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // getMe is called for bot.Username(), then answerInlineQuery
+        require.Len(t, caller.calls, 2)
+        assert.Contains(t, caller.calls[0].URL, "getMe")
+        assert.Contains(t, caller.calls[1].URL, "answerInlineQuery")
+
+        var params struct {
+                InlineQueryID string `json:"inline_query_id"`
+                Results       []struct {
+                        Type  string `json:"type"`
+                        ID    string `json:"id"`
+                        Title string `json:"title"`
+                } `json:"results"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[1].Data.BodyRaw, &params))
+        assert.Equal(t, "test-query-2", params.InlineQueryID)
+        require.Len(t, params.Results, 1)
+        assert.Equal(t, "article", params.Results[0].Type)
+        assert.Equal(t, "help", params.Results[0].ID)
+        assert.Equal(t, "Ask me anything", params.Results[0].Title)
+}
+
+func TestHandleInlineQuery_Enabled_NonEmptyQuery_ReturnsQueryArticle(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        messageBus := bus.NewMessageBus()
+        ch := newTestChannel(t, caller)
+        ch.tgCfg.EnableInline = true
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+
+        query := &telego.InlineQuery{
+                ID:    "test-query-3",
+                From:  telego.User{ID: 42, FirstName: "Alice", Username: "alice"},
+                Query: "what is the weather?",
+        }
+
+        err := ch.handleInlineQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        require.Len(t, caller.calls, 1)
+        assert.Contains(t, caller.calls[0].URL, "answerInlineQuery")
+
+        var params struct {
+                InlineQueryID string `json:"inline_query_id"`
+                IsPersonal    bool   `json:"is_personal"`
+                Results       []struct {
+                        Type  string `json:"type"`
+                        ID    string `json:"id"`
+                        Title string `json:"title"`
+                } `json:"results"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+        assert.Equal(t, "test-query-3", params.InlineQueryID)
+        assert.True(t, params.IsPersonal)
+        require.Len(t, params.Results, 1)
+        assert.Equal(t, "article", params.Results[0].Type)
+        assert.Equal(t, "query", params.Results[0].ID)
+        assert.Equal(t, "what is the weather?", params.Results[0].Title)
+}
+
+func TestHandleInlineQuery_Enabled_NonEmptyQuery_PublishesInboundMessage(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        messageBus := bus.NewMessageBus()
+        ch := newTestChannel(t, caller)
+        ch.tgCfg.EnableInline = true
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+
+        query := &telego.InlineQuery{
+                ID:    "test-query-4",
+                From:  telego.User{ID: 42, FirstName: "Alice"},
+                Query: "tell me a joke",
+        }
+
+        err := ch.handleInlineQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Wait for the async goroutine to publish the inbound message
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message from inline query")
+
+        assert.Equal(t, "inline", inbound.Context.ChatType)
+        assert.Equal(t, "inline:42", inbound.Context.ChatID)
+        assert.Equal(t, "inline_query", inbound.Context.Raw["message_kind"])
+        assert.Equal(t, "test-query-4", inbound.Context.Raw["inline_query_id"])
+        assert.Equal(t, "tell me a joke", inbound.Context.Raw["query_text"])
+        assert.Contains(t, inbound.Content, "[inline_query:")
+        assert.Contains(t, inbound.Content, "tell me a joke")
+}
+
+func TestAnswerInlineQuery_ConvertsResultsToArticles(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        results := []channels.InlineQueryResult{
+                {
+                        ID:          "1",
+                        Title:       "First result",
+                        Description: "Description 1",
+                        Content:     "Content of first result",
+                        URL:         "https://example.com/1",
+                },
+                {
+                        ID:          "2",
+                        Title:       "Second result",
+                        Description: "Description 2",
+                        Content:     "Content of second result",
+                },
+        }
+
+        err := ch.AnswerInlineQuery(context.Background(), "query-123", results)
+        require.NoError(t, err)
+
+        require.Len(t, caller.calls, 1)
+        assert.Contains(t, caller.calls[0].URL, "answerInlineQuery")
+
+        var params struct {
+                InlineQueryID string `json:"inline_query_id"`
+                CacheTime     int    `json:"cache_time"`
+                IsPersonal    bool   `json:"is_personal"`
+                Results       []struct {
+                        Type  string `json:"type"`
+                        ID    string `json:"id"`
+                        Title string `json:"title"`
+                } `json:"results"`
+        }
+        require.NoError(t, json.Unmarshal(caller.calls[0].Data.BodyRaw, &params))
+        assert.Equal(t, "query-123", params.InlineQueryID)
+        assert.Equal(t, 30, params.CacheTime)
+        assert.True(t, params.IsPersonal)
+        require.Len(t, params.Results, 2)
+        assert.Equal(t, "article", params.Results[0].Type)
+        assert.Equal(t, "1", params.Results[0].ID)
+        assert.Equal(t, "First result", params.Results[0].Title)
+        assert.Equal(t, "2", params.Results[1].ID)
+}
+
+func TestHandleInlineQuery_WithLocation_RecordsLocationInRaw(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerInlineQuery") {
+                                return &ta.Response{Ok: true, Result: []byte("true")}, nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        messageBus := bus.NewMessageBus()
+        ch := newTestChannel(t, caller)
+        ch.tgCfg.EnableInline = true
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+
+        query := &telego.InlineQuery{
+                ID:    "test-query-loc",
+                From:  telego.User{ID: 42, FirstName: "Alice"},
+                Query: "nearby restaurants",
+                Location: &telego.Location{
+                        Latitude:  40.7128,
+                        Longitude: -74.0060,
+                },
+        }
+
+        err := ch.handleInlineQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Wait for async inbound message
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message with location data")
+
+        assert.Contains(t, inbound.Context.Raw, "location_lat")
+        assert.Contains(t, inbound.Context.Raw, "location_lng")
+}

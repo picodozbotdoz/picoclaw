@@ -386,6 +386,7 @@ type TelegramSettings struct {
         Streaming     StreamingConfig `json:"streaming,omitempty" yaml:"-"`
         UseMarkdownV2 bool            `json:"use_markdown_v2"     yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_USE_MARKDOWN_V2"`
         ReactionEmoji string          `json:"reaction_emoji"      yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_REACTION_EMOJI"`
+        EnableInline  bool            `json:"enable_inline"       yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_ENABLE_INLINE"`
 }
 
 type FeishuSettings struct {
