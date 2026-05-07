@@ -1902,3 +1902,522 @@ func TestQuotedTelegramMediaRefs_AllTypesInOrder(t *testing.T) {
         // Order: photo, voice, audio, document, video
         assert.Equal(t, []string{"photo1", "voice1", "audio1", "doc1", "vid1"}, order)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: Callback Query tests
+// ---------------------------------------------------------------------------
+
+// helperCallbackMessage creates a telego.Message that satisfies
+// MaybeInaccessibleMessage for use in callback query tests.
+func helperCallbackMessage(chatID int64, chatType string, messageID int, isForum bool, threadID int) *telego.Message {
+        msg := &telego.Message{
+                MessageID: messageID,
+                Chat: telego.Chat{
+                        ID:      chatID,
+                        Type:    chatType,
+                        IsForum: isForum,
+                },
+        }
+        if threadID != 0 {
+                msg.MessageThreadID = threadID
+        }
+        return msg
+}
+
+// successTrueResponse returns a ta.Response with `true` result (used by answerCallbackQuery).
+func successTrueResponse(t *testing.T) *ta.Response {
+        t.Helper()
+        return &ta.Response{Ok: true, Result: []byte("true")}
+}
+
+func TestHandleCallbackQuery_PrivateChat_PublishesInbound(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:           "cb123",
+                From:         telego.User{ID: 42, FirstName: "Alice", Username: "alice42"},
+                ChatInstance: "123456789",
+                Data:         "confirm_yes",
+        }
+        // Set the Message field — use a regular message (accessible).
+        callbackMsg := helperCallbackMessage(999, "private", 50, false, 0)
+        query.Message = callbackMsg
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message on bus")
+
+        assert.Equal(t, "[callback: confirm_yes]", inbound.Content)
+        assert.Equal(t, "callback_query", inbound.Context.Raw["message_kind"])
+        assert.Equal(t, "cb123", inbound.Context.Raw["callback_query_id"])
+        assert.Equal(t, "confirm_yes", inbound.Context.Raw["callback_data"])
+        assert.Equal(t, "123456789", inbound.Context.Raw["chat_instance"])
+        assert.Equal(t, "999", inbound.Context.ChatID)
+        assert.Equal(t, "50", inbound.Context.MessageID)
+        assert.Equal(t, "direct", inbound.Context.ChatType)
+        assert.True(t, inbound.Context.Mentioned, "callback queries should always be treated as mentioned")
+}
+
+func TestHandleCallbackQuery_AnswerCallbackQuery_Called(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        var answerCalled bool
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                answerCalled = true
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_ack",
+                From: telego.User{ID: 10, FirstName: "Bob"},
+                Data: "btn_click",
+        }
+        query.Message = helperCallbackMessage(100, "private", 1, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+        assert.True(t, answerCalled, "AnswerCallbackQuery should have been called")
+}
+
+func TestHandleCallbackQuery_AnswerCallbackQuery_Failure_NonFatal(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return nil, errors.New("network timeout")
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_fail",
+                From: telego.User{ID: 10, FirstName: "Bob"},
+                Data: "btn_ok",
+        }
+        query.Message = helperCallbackMessage(100, "private", 1, false, 0)
+
+        // Should NOT return an error — acknowledgment failure is non-fatal.
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // The inbound message should still be published.
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "inbound message should still be published despite ack failure")
+        assert.Equal(t, "[callback: btn_ok]", inbound.Content)
+}
+
+func TestHandleCallbackQuery_GroupChat_SetsGroupChatType(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_group",
+                From: telego.User{ID: 20, FirstName: "Carol"},
+                Data: "vote_yes",
+        }
+        query.Message = helperCallbackMessage(-1001234567890, "supergroup", 200, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        assert.Equal(t, "group", inbound.Context.ChatType)
+        assert.Equal(t, "-1001234567890", inbound.Context.ChatID)
+}
+
+func TestHandleCallbackQuery_ForumTopic_CompositeChatID(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_forum",
+                From: telego.User{ID: 30, FirstName: "Dave"},
+                Data: "topic_action",
+        }
+        query.Message = helperCallbackMessage(-100999, "supergroup", 300, true, 42)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        assert.Equal(t, "-100999/42", inbound.Context.ChatID, "forum callback should use composite chat ID")
+        assert.Equal(t, "42", inbound.Context.TopicID)
+}
+
+func TestHandleCallbackQuery_NilQuery_NoOp(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        ch := &TelegramChannel{
+                BaseChannel: channels.NewBaseChannel("telegram", nil, messageBus, nil),
+                chatIDs:     make(map[string]int64),
+                ctx:         context.Background(),
+        }
+
+        err := ch.handleCallbackQuery(context.Background(), nil)
+        require.NoError(t, err)
+
+        // No message should be published.
+        select {
+        case <-messageBus.InboundChan():
+                t.Fatal("no inbound message should be published for nil query")
+        default:
+        }
+}
+
+func TestHandleCallbackQuery_AllowlistRejected_NoInboundMessage(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, []string{"99999"})
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_rejected",
+                From: telego.User{ID: 42, FirstName: "Blocked"},
+                Data: "btn",
+        }
+        query.Message = helperCallbackMessage(100, "private", 1, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Ack should still be called even for rejected users.
+        assert.Len(t, caller.calls, 1, "AnswerCallbackQuery should still be called")
+        assert.Contains(t, caller.calls[0].URL, "answerCallbackQuery")
+
+        // No inbound message should be published.
+        select {
+        case <-messageBus.InboundChan():
+                t.Fatal("no inbound message for allowlisted-rejected user")
+        default:
+        }
+}
+
+func TestHandleCallbackQuery_NoMessageAndNoInlineMessage_SkipsPublish(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:           "cb_nomsg",
+                From:         telego.User{ID: 10, FirstName: "Eve"},
+                ChatInstance: "abc",
+                Data:         "orphan_btn",
+                // Message is nil and InlineMessageID is empty → can't determine chat.
+        }
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Ack should still be called.
+        assert.Len(t, caller.calls, 1)
+
+        // No inbound message — can't route without a chat.
+        select {
+        case <-messageBus.InboundChan():
+                t.Fatal("no inbound message should be published when chat is unidentifiable")
+        default:
+        }
+}
+
+func TestHandleCallbackQuery_InlineMessage_SetsInlineMetadata(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:              "cb_inline",
+                From:            telego.User{ID: 55, FirstName: "Frank"},
+                ChatInstance:    "987654321",
+                InlineMessageID: "inline_msg_42",
+                Data:            "inline_action",
+        }
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok, "expected inbound message for inline callback")
+        assert.Equal(t, "[callback: inline_action]", inbound.Content)
+        assert.Equal(t, "inline", inbound.Context.ChatType)
+        assert.Equal(t, "inline_msg_42", inbound.Context.MessageID)
+        assert.Equal(t, "inline_msg_42", inbound.Context.Raw["inline_message_id"])
+}
+
+func TestHandleCallbackQuery_GameShortName_Recorded(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:           "cb_game",
+                From:         telego.User{ID: 60, FirstName: "Gamer"},
+                ChatInstance: "111",
+                Data:         "",
+                GameShortName: "my_cool_game",
+        }
+        query.Message = helperCallbackMessage(200, "private", 5, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        assert.Equal(t, "my_cool_game", inbound.Context.Raw["game_short_name"])
+        // Content for empty data should still be produced.
+        assert.Equal(t, "[callback: ]", inbound.Content)
+}
+
+func TestHandleCallbackQuery_SenderInfo_Populated(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_sender",
+                From: telego.User{ID: 777, FirstName: "Grace", Username: "grace777"},
+                Data: "click_me",
+        }
+        query.Message = helperCallbackMessage(300, "private", 10, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        assert.Equal(t, "telegram", inbound.Sender.Platform)
+        assert.Equal(t, "777", inbound.Sender.PlatformID)
+        assert.Equal(t, "telegram:777", inbound.Sender.CanonicalID)
+        assert.Equal(t, "grace777", inbound.Sender.Username)
+        assert.Equal(t, "Grace", inbound.Sender.DisplayName)
+}
+
+func TestHandleCallbackQuery_ChatIDStored(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_store",
+                From: telego.User{ID: 888, FirstName: "Heidi"},
+                Data: "store_test",
+        }
+        query.Message = helperCallbackMessage(555, "private", 20, false, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        // Drain the inbound message.
+        <-messageBus.InboundChan()
+
+        // Verify the chatID was stored for potential outbound use.
+        assert.Equal(t, int64(555), ch.chatIDs["888"])
+}
+
+func TestAnswerCallbackQuery_PublicAPIMethod(t *testing.T) {
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                var params map[string]any
+                                require.NoError(t, json.Unmarshal(data.BodyRaw, &params))
+                                assert.Equal(t, "query123", params["callback_query_id"])
+                                assert.Equal(t, "Processing...", params["text"])
+                                assert.Equal(t, true, params["show_alert"])
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+
+        err := ch.AnswerCallbackQuery(context.Background(), "query123", "Processing...", true)
+        require.NoError(t, err)
+        assert.Len(t, caller.calls, 1)
+}
+
+func TestTelegramChannel_ImplementsCallbackQueryCapable(t *testing.T) {
+        // Compile-time assertion is in telegram.go; this runtime test is a safety net.
+        var _ channels.CallbackQueryCapable = (*TelegramChannel)(nil)
+}
+
+func TestHandleCallbackQuery_InaccessibleMessage_StillExtractsChatAndID(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        // Simulate an inaccessible message (e.g., message was deleted).
+        inaccessible := &telego.InaccessibleMessage{
+                Chat:      telego.Chat{ID: -100555, Type: "supergroup"},
+                MessageID: 400,
+                Date:      0,
+        }
+
+        query := &telego.CallbackQuery{
+                ID:        "cb_inaccessible",
+                From:      telego.User{ID: 90, FirstName: "Ivan"},
+                Data:      "old_btn",
+        }
+        query.Message = inaccessible
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        assert.Equal(t, "-100555", inbound.Context.ChatID)
+        assert.Equal(t, "400", inbound.Context.MessageID)
+        assert.Equal(t, "group", inbound.Context.ChatType)
+        assert.Equal(t, "[callback: old_btn]", inbound.Content)
+}
+
+func TestHandleCallbackQuery_ForumWithoutThread_NoCompositeChatID(t *testing.T) {
+        messageBus := bus.NewMessageBus()
+        caller := &stubCaller{
+                callFn: func(ctx context.Context, url string, data *ta.RequestData) (*ta.Response, error) {
+                        if strings.Contains(url, "answerCallbackQuery") {
+                                return successTrueResponse(t), nil
+                        }
+                        t.Fatalf("unexpected API call: %s", url)
+                        return nil, nil
+                },
+        }
+        ch := newTestChannel(t, caller)
+        ch.BaseChannel = channels.NewBaseChannel("telegram", nil, messageBus, nil)
+        ch.ctx = context.Background()
+
+        query := &telego.CallbackQuery{
+                ID:   "cb_forum_nothread",
+                From: telego.User{ID: 99, FirstName: "Judy"},
+                Data: "general_topic_btn",
+        }
+        // Forum chat but no thread ID (General topic or thread ID = 0).
+        query.Message = helperCallbackMessage(-100777, "supergroup", 500, true, 0)
+
+        err := ch.handleCallbackQuery(context.Background(), query)
+        require.NoError(t, err)
+
+        inbound, ok := <-messageBus.InboundChan()
+        require.True(t, ok)
+        // Without a thread ID, no composite chat ID.
+        assert.Equal(t, "-100777", inbound.Context.ChatID)
+        assert.Empty(t, inbound.Context.TopicID)
+}

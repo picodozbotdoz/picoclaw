@@ -45,7 +45,8 @@ var (
 
 // Compile-time interface assertions.
 var (
-        _ channels.ReactionCapable = (*TelegramChannel)(nil)
+        _ channels.ReactionCapable      = (*TelegramChannel)(nil)
+        _ channels.CallbackQueryCapable = (*TelegramChannel)(nil)
 )
 
 type TelegramChannel struct {
@@ -153,6 +154,10 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
         bh.HandleMessage(func(ctx *th.Context, message telego.Message) error {
                 return c.handleMessage(ctx, &message)
         }, th.AnyMessage())
+
+        bh.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
+                return c.handleCallbackQuery(ctx, &query)
+        })
 
         c.SetRunning(true)
         logger.InfoCF("telegram", "Telegram bot connected", map[string]any{
@@ -550,6 +555,171 @@ func (c *TelegramChannel) ReactToMessage(ctx context.Context, chatID, messageID 
                         })
                 }
         }, nil
+}
+
+// AnswerCallbackQuery implements channels.CallbackQueryCapable.
+// It acknowledges a callback query from an inline keyboard button tap.
+// The Telegram API requires acknowledgment within 30 seconds; callers
+// should invoke this immediately upon receiving a callback query.
+func (c *TelegramChannel) AnswerCallbackQuery(ctx context.Context, queryID string, text string, showAlert bool) error {
+        return c.bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
+                CallbackQueryID: queryID,
+                Text:            text,
+                ShowAlert:       showAlert,
+        })
+}
+
+// handleCallbackQuery processes callback queries from inline keyboard buttons.
+// It immediately acknowledges the callback (Telegram requires this within 30s)
+// and then publishes the callback data as an inbound message so the agent can
+// process it in the normal conversation flow.
+//
+// The callback is converted into an InboundMessage with:
+//   - Content: "[callback: <data>]" (the button's callback_data)
+//   - Raw["message_kind"]: "callback_query"
+//   - Raw["callback_query_id"]: the Telegram callback query ID
+//   - Raw["callback_data"]: the button's callback data
+//   - ChatID/MessageID: extracted from the originating message
+//   - SenderID: the user who tapped the button
+func (c *TelegramChannel) handleCallbackQuery(ctx context.Context, query *telego.CallbackQuery) error {
+        if query == nil {
+                return nil
+        }
+
+        // Immediately acknowledge the callback to satisfy Telegram's 30-second deadline.
+        // We use a background context in case the original context is already expired,
+        // since the acknowledgment must be sent regardless.
+        ackErr := c.bot.AnswerCallbackQuery(context.Background(), &telego.AnswerCallbackQueryParams{
+                CallbackQueryID: query.ID,
+        })
+        if ackErr != nil {
+                logger.WarnCF("telegram", "Failed to answer callback query", map[string]any{
+                        "query_id": query.ID,
+                        "error":    ackErr.Error(),
+                })
+                // Non-fatal: continue processing even if acknowledgment fails.
+        }
+
+        // Extract the user who tapped the button.
+        platformID := fmt.Sprintf("%d", query.From.ID)
+        sender := bus.SenderInfo{
+                Platform:    "telegram",
+                PlatformID:  platformID,
+                CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                Username:    query.From.Username,
+                DisplayName: query.From.FirstName,
+        }
+
+        // Allowlist check.
+        if !c.IsAllowedSender(sender) {
+                logger.DebugCF("telegram", "Callback query rejected by allowlist", map[string]any{
+                        "user_id": platformID,
+                })
+                return nil
+        }
+
+        // Extract chat and message info from the callback.
+        // Callback queries can originate from a regular message or an inline message.
+        var chatID int64
+        var chatType string
+        var messageID string
+        var threadID int
+
+        if query.Message != nil {
+                chatInfo := query.Message.GetChat()
+                chatID = chatInfo.ID
+                chatType = chatInfo.Type
+                messageID = fmt.Sprintf("%d", query.Message.GetMessageID())
+
+                // Try to extract thread/topic ID from accessible messages.
+                if msg := query.Message.Message(); msg != nil && msg.MessageThreadID != 0 {
+                        threadID = msg.MessageThreadID
+                }
+        } else if query.InlineMessageID != "" {
+                // Inline messages don't carry chat/message IDs directly.
+                // Use chat_instance as a best-effort identifier.
+                chatID = 0
+                chatType = "inline"
+                messageID = query.InlineMessageID
+        }
+
+        // If we couldn't determine the chat, we can't route the callback.
+        if chatID == 0 && query.InlineMessageID == "" {
+                logger.WarnCF("telegram", "Callback query has no identifiable chat", map[string]any{
+                        "query_id": query.ID,
+                })
+                return nil
+        }
+
+        // Build the content string from the callback data.
+        callbackData := query.Data
+        content := fmt.Sprintf("[callback: %s]", callbackData)
+
+        // Determine the delivery chat ID (with forum topic isolation if applicable).
+        chatIDStr := fmt.Sprintf("%d", chatID)
+        var deliveryChatID string
+        var topicID string
+
+        isForum := false
+        if query.Message != nil {
+                chatInfo := query.Message.GetChat()
+                isForum = chatInfo.IsForum
+        }
+
+        if isForum && threadID != 0 {
+                deliveryChatID = fmt.Sprintf("%d/%d", chatID, threadID)
+                topicID = fmt.Sprintf("%d", threadID)
+        } else {
+                deliveryChatID = chatIDStr
+        }
+
+        // Store the chatID for potential outbound use.
+        c.chatIDs[platformID] = chatID
+
+        // Map Telegram chat types to platform-agnostic types.
+        normalizedChatType := "direct"
+        switch chatType {
+        case "group", "supergroup":
+                normalizedChatType = "group"
+        case "channel":
+                normalizedChatType = "channel"
+        case "inline":
+                normalizedChatType = "inline"
+        }
+
+        // Determine if this is a group where the bot is mentioned.
+        // Callback queries are always intentional (user explicitly tapped a button),
+        // so we always process them regardless of group trigger settings.
+        mentioned := true
+
+        inboundCtx := bus.InboundContext{
+                Channel:  c.Name(),
+                ChatID:   deliveryChatID,
+                ChatType: normalizedChatType,
+                SenderID: sender.CanonicalID,
+                MessageID: messageID,
+                TopicID:  topicID,
+                Mentioned: mentioned,
+                Raw: map[string]string{
+                        "message_kind":       "callback_query",
+                        "callback_query_id":  query.ID,
+                        "callback_data":      callbackData,
+                        "chat_instance":      query.ChatInstance,
+                },
+        }
+
+        // If the callback came from a game, note that.
+        if query.GameShortName != "" {
+                inboundCtx.Raw["game_short_name"] = query.GameShortName
+        }
+
+        // If the callback originated from an inline message, record that.
+        if query.InlineMessageID != "" {
+                inboundCtx.Raw["inline_message_id"] = query.InlineMessageID
+        }
+
+        c.HandleMessageWithContext(ctx, deliveryChatID, content, nil, inboundCtx, sender)
+        return nil
 }
 
 func outboundMessageIsToolFeedback(msg bus.OutboundMessage) bool {
