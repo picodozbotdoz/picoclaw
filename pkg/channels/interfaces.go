@@ -77,3 +77,24 @@ type CommandRegistrarCapable interface {
 type CallbackQueryCapable interface {
         AnswerCallbackQuery(ctx context.Context, queryID string, text string, showAlert bool) error
 }
+
+// InlineQueryCapable is implemented by channels that can handle inline
+// queries (e.g. typing @botname query in any chat on Telegram). The channel
+// must respond with inline query results within the platform's time limit
+// (10 seconds for Telegram). Unlike regular messages, inline queries are
+// transient and do not create a conversation session.
+type InlineQueryCapable interface {
+        AnswerInlineQuery(ctx context.Context, queryID string, results []InlineQueryResult) error
+}
+
+// InlineQueryResult represents a single result item for an inline query
+// response. Channels map this platform-agnostic structure to their
+// platform-specific result types (e.g. Telegram's InlineQueryResultArticle).
+type InlineQueryResult struct {
+        ID          string `json:"id"`
+        Title       string `json:"title"`
+        Description string `json:"description,omitempty"`
+        Content     string `json:"content"` // The text content to send when the user selects this result
+        URL         string `json:"url,omitempty"`
+        ThumbURL    string `json:"thumb_url,omitempty"`
+}

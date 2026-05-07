@@ -144,3 +144,17 @@ type VoiceControl struct {
         Type      string `json:"type"`   // "state", "command"
         Action    string `json:"action"` // "idle", "listening", "start", "stop", "leave"
 }
+
+// InlineQueryEvent represents an inline query received from a user typing
+// @botname <query> in any chat. Inline queries are transient and do not
+// belong to a session — the bot must respond with results directly via
+// AnswerInlineQuery within 10 seconds.
+type InlineQueryEvent struct {
+        Channel  string            `json:"channel"`
+        Query    string            `json:"query"`
+        QueryID  string            `json:"query_id"`
+        SenderID string            `json:"sender_id"`
+        ChatType string            `json:"chat_type,omitempty"` // sender / private / group / supergroup / channel
+        Offset   string            `json:"offset,omitempty"`    // pagination offset for next results
+        Raw      map[string]string `json:"raw,omitempty"`
+}

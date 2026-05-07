@@ -47,6 +47,7 @@ var (
 var (
         _ channels.ReactionCapable      = (*TelegramChannel)(nil)
         _ channels.CallbackQueryCapable = (*TelegramChannel)(nil)
+        _ channels.InlineQueryCapable   = (*TelegramChannel)(nil)
 )
 
 type TelegramChannel struct {
@@ -157,6 +158,10 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
 
         bh.HandleCallbackQuery(func(ctx *th.Context, query telego.CallbackQuery) error {
                 return c.handleCallbackQuery(ctx, &query)
+        })
+
+        bh.HandleInlineQuery(func(ctx *th.Context, query telego.InlineQuery) error {
+                return c.handleInlineQuery(ctx, &query)
         })
 
         c.SetRunning(true)
@@ -719,6 +724,206 @@ func (c *TelegramChannel) handleCallbackQuery(ctx context.Context, query *telego
         }
 
         c.HandleMessageWithContext(ctx, deliveryChatID, content, nil, inboundCtx, sender)
+        return nil
+}
+
+// AnswerInlineQuery implements channels.InlineQueryCapable.
+// It responds to an inline query with a list of results. The Telegram API
+// requires a response within 10 seconds; callers should invoke this as
+// soon as results are available.
+func (c *TelegramChannel) AnswerInlineQuery(ctx context.Context, queryID string, results []channels.InlineQueryResult) error {
+        var tgResults []telego.InlineQueryResult
+        for _, r := range results {
+                article := &telego.InlineQueryResultArticle{
+                        Type:  telego.ResultTypeArticle,
+                        ID:    r.ID,
+                        Title: r.Title,
+                        InputMessageContent: &telego.InputTextMessageContent{
+                                MessageText: r.Content,
+                        },
+                        Description:  r.Description,
+                        ThumbnailURL: r.ThumbURL,
+                        URL:          r.URL,
+                }
+                tgResults = append(tgResults, article)
+        }
+
+        params := tu.InlineQuery(queryID, tgResults...)
+        params.CacheTime = 30    // Cache results for 30 seconds
+        params.IsPersonal = true // Results are personal (tailored to the user)
+
+        return c.bot.AnswerInlineQuery(ctx, params)
+}
+
+// handleInlineQuery processes inline queries from users typing @botname <query>
+// in any chat. Inline queries are transient — they do not belong to a session
+// and the bot must respond with results directly via AnswerInlineQuery within
+// 10 seconds.
+//
+// The implementation follows a "quick response" strategy:
+//   - If inline mode is disabled (EnableInline is false), return empty results
+//   - If the query is empty, return a help/usage article
+//   - Otherwise, publish the query as an InboundMessage so the agent can
+//     process it, and return a "thinking" placeholder article while the
+//     agent generates the actual response
+func (c *TelegramChannel) handleInlineQuery(ctx context.Context, query *telego.InlineQuery) error {
+        if query == nil {
+                return nil
+        }
+
+        // If inline mode is not enabled, return empty results to acknowledge
+        // the query without exposing bot functionality.
+        if !c.tgCfg.EnableInline {
+                _ = c.bot.AnswerInlineQuery(context.Background(), &telego.AnswerInlineQueryParams{
+                        InlineQueryID: query.ID,
+                        Results:       []telego.InlineQueryResult{},
+                        CacheTime:     0,
+                })
+                return nil
+        }
+
+        // Extract the user who sent the inline query.
+        platformID := fmt.Sprintf("%d", query.From.ID)
+        sender := bus.SenderInfo{
+                Platform:    "telegram",
+                PlatformID:  platformID,
+                CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+                Username:    query.From.Username,
+                DisplayName: query.From.FirstName,
+        }
+
+        // Allowlist check.
+        if !c.IsAllowedSender(sender) {
+                logger.DebugCF("telegram", "Inline query rejected by allowlist", map[string]any{
+                        "user_id": platformID,
+                })
+                _ = c.bot.AnswerInlineQuery(context.Background(), &telego.AnswerInlineQueryParams{
+                        InlineQueryID: query.ID,
+                        Results:       []telego.InlineQueryResult{},
+                        CacheTime:     0,
+                })
+                return nil
+        }
+
+        queryText := query.Query
+        chatType := query.ChatType
+
+        // Build the inline query event for logging/processing.
+        inlineEvent := bus.InlineQueryEvent{
+                Channel:  c.Name(),
+                Query:    queryText,
+                QueryID:  query.ID,
+                SenderID: sender.CanonicalID,
+                ChatType: chatType,
+                Offset:   query.Offset,
+                Raw: map[string]string{
+                        "message_kind": "inline_query",
+                },
+        }
+
+        // If the query includes a location, record it.
+        if query.Location != nil {
+                inlineEvent.Raw["location_lat"] = fmt.Sprintf("%f", query.Location.Latitude)
+                inlineEvent.Raw["location_lng"] = fmt.Sprintf("%f", query.Location.Longitude)
+        }
+
+        logger.InfoCF("telegram", "Received inline query", map[string]any{
+                "query_id":   query.ID,
+                "query":      queryText,
+                "user_id":    platformID,
+                "chat_type":  chatType,
+                "offset":     query.Offset,
+        })
+
+        // For an LLM-powered bot, we can't wait for a full agent response
+        // within the 10-second Telegram deadline. Instead, we publish the
+        // query as an inbound message for the agent to process, and return
+        // a "thinking" placeholder article that the user can tap to send
+        // the query text to the bot as a regular message.
+        //
+        // If the query is empty, provide a help article instead.
+        var results []telego.InlineQueryResult
+
+        if strings.TrimSpace(queryText) == "" {
+                // Empty query: return a help article suggesting the user type something.
+                results = []telego.InlineQueryResult{
+                        &telego.InlineQueryResultArticle{
+                                Type:  telego.ResultTypeArticle,
+                                ID:    "help",
+                                Title: "Ask me anything",
+                                InputMessageContent: &telego.InputTextMessageContent{
+                                        MessageText: fmt.Sprintf("Hello! I'm %s. Type your question after my name to get started.", c.bot.Username()),
+                                },
+                                Description: fmt.Sprintf("Type @%s <your question> to ask me anything.", c.bot.Username()),
+                        },
+                }
+        } else {
+                // Non-empty query: return a single article that sends the query
+                // text to the current chat. The user's query is also published
+                // as an inbound message so the agent can process it and respond
+                // in the user's private chat with the bot.
+                results = []telego.InlineQueryResult{
+                        &telego.InlineQueryResultArticle{
+                                Type:  telego.ResultTypeArticle,
+                                ID:    "query",
+                                Title: queryText,
+                                InputMessageContent: &telego.InputTextMessageContent{
+                                        MessageText: queryText,
+                                },
+                                Description: "Tap to send this query to the chat",
+                        },
+                }
+
+                // Also publish as an inbound message so the agent can process
+                // it and potentially respond in the user's private chat with
+                // the bot. Use the sender's canonical ID as the chat ID so
+                // the agent routes the response to the private conversation.
+                content := fmt.Sprintf("[inline_query: %s]", queryText)
+                deliveryChatID := fmt.Sprintf("inline:%s", platformID)
+
+                inboundCtx := bus.InboundContext{
+                        Channel:   c.Name(),
+                        ChatID:    deliveryChatID,
+                        ChatType:  "inline",
+                        SenderID:  sender.CanonicalID,
+                        MessageID: query.ID,
+                        Mentioned: true,
+                        Raw: map[string]string{
+                                "message_kind":   "inline_query",
+                                "inline_query_id": query.ID,
+                                "query_text":     queryText,
+                                "chat_type":       chatType,
+                                "offset":          query.Offset,
+                        },
+                }
+
+                // Include location data if present.
+                if query.Location != nil {
+                        inboundCtx.Raw["location_lat"] = fmt.Sprintf("%f", query.Location.Latitude)
+                        inboundCtx.Raw["location_lng"] = fmt.Sprintf("%f", query.Location.Longitude)
+                }
+
+                // Publish asynchronously to avoid blocking the inline query
+                // response deadline. The agent will process the message and
+                // send a response to the user's private chat.
+                go c.HandleMessageWithContext(context.Background(), deliveryChatID, content, nil, inboundCtx, sender)
+        }
+
+        // Answer the inline query with our results.
+        // Use a background context in case the original context has expired.
+        err := c.bot.AnswerInlineQuery(context.Background(), &telego.AnswerInlineQueryParams{
+                InlineQueryID: query.ID,
+                Results:       results,
+                CacheTime:     30,
+                IsPersonal:    true,
+        })
+        if err != nil {
+                logger.WarnCF("telegram", "Failed to answer inline query", map[string]any{
+                        "query_id": query.ID,
+                        "error":    err.Error(),
+                })
+        }
+
         return nil
 }
 
