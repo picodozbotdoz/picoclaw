@@ -31,6 +31,9 @@ type InboundContext struct {
         ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
         ReplyToSenderID  string `json:"reply_to_sender_id,omitempty"`
 
+        IsEdit   bool  `json:"is_edit,omitempty"`    // true when this is an edited version of a prior message
+        EditDate int64 `json:"edit_date,omitempty"` // Unix timestamp of the edit (0 if not an edit)
+
         ReplyHandles map[string]string `json:"reply_handles,omitempty"`
         Raw          map[string]string `json:"raw,omitempty"`
 }
@@ -157,4 +160,20 @@ type InlineQueryEvent struct {
         ChatType string            `json:"chat_type,omitempty"` // sender / private / group / supergroup / channel
         Offset   string            `json:"offset,omitempty"`    // pagination offset for next results
         Raw      map[string]string `json:"raw,omitempty"`
+}
+
+// ChatMemberEvent represents a change in chat membership status. These events
+// are administrative — they do not belong to a conversation session. Consumers
+// can use them for welcome messages, access control, or group management.
+type ChatMemberEvent struct {
+        Channel      string `json:"channel"`
+        ChatID       string `json:"chat_id"`
+        ChatType     string `json:"chat_type,omitempty"` // private / group / supergroup / channel
+        ActorID      string `json:"actor_id"`           // user who performed the action
+        UserID       string `json:"user_id"`            // user whose status changed
+        OldStatus    string `json:"old_status"`         // left / member / administrator / restricted / kicked / creator
+        NewStatus    string `json:"new_status"`         // left / member / administrator / restricted / kicked / creator
+        IsMyChatMember bool `json:"is_my_chat_member"` // true if this is about the bot itself
+        Date         int64  `json:"date"`              // Unix timestamp of the change
+        Raw          map[string]string `json:"raw,omitempty"`
 }
