@@ -272,14 +272,29 @@ func (p *Provider) SupportsThinking() bool {
         return p.isDeepSeekReasoningProvider()
 }
 
+// hasReasoningContentInHistory checks whether any assistant message in the
+// conversation history contains reasoning_content. Non-DeepSeek providers
+// (e.g. Mimo/xiaomimimo) that return reasoning_content require it to be
+// passed back on subsequent turns, just like DeepSeek V4.
+func hasReasoningContentInHistory(messages []Message) bool {
+	for _, m := range messages {
+		if m.Role == "assistant" && strings.TrimSpace(m.ReasoningContent) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Provider) prepareMessagesForRequest(messages []Message, model string, tools []ToolDefinition, options map[string]any) []Message {
         if len(messages) == 0 {
                 return nil
         }
 
-        if p.isDeepSeekReasoningProvider() {
+        if p.isDeepSeekReasoningProvider() || hasReasoningContentInHistory(messages) {
                 // DeepSeek V4 models (deepseek-v4-flash, deepseek-v4-pro) require
                 // reasoning_content to be preserved in multi-turn conversations per API docs.
+                // Non-DeepSeek providers (e.g. Mimo) that return reasoning_content also need
+                // it preserved, otherwise the API rejects subsequent turns with HTTP 400.
                 // For V4 models, we only strip transient thought-only messages that
                 // have no content or tool calls.
                 //
