@@ -145,18 +145,42 @@ type TurnEndPayload struct {
 
 // LLMRequestPayload describes an outbound LLM request.
 type LLMRequestPayload struct {
-        Model         string
-        MessagesCount int
-        ToolsCount    int
-        MaxTokens     int
-        Temperature   float64
+	Model          string
+	MessagesCount  int
+	ToolsCount     int
+	MaxTokens      int
+	Temperature    float64
+	// Extended fields for tracing (LLMCallStart).
+	// When TraceID is non-empty, EventSubscriber persists an llm_calls row.
+	TraceID       string `json:",omitempty"`
+	Provider      string `json:",omitempty"`
+	ThinkingMode  string `json:",omitempty"`
+	IsStreaming   bool   `json:",omitempty"`
+	// MessagesJSON is the full JSON-encoded messages array.
+	// Only populated when tracing.CaptureRequestMsgs is enabled.
+	// Stored as a string to avoid double-encoding through the event bus.
+	MessagesJSON  string `json:",omitempty"`
 }
 
 // LLMResponsePayload describes an inbound LLM response.
 type LLMResponsePayload struct {
-        ContentLen   int
-        ToolCalls    int
-        HasReasoning bool
+	ContentLen    int
+	ToolCalls     int
+	HasReasoning  bool
+	// Extended fields for tracing (LLMCallEnd).
+	TraceID          string `json:",omitempty"`
+	LatencyMs        int64  `json:",omitempty"`
+	PromptTokens     int    `json:",omitempty"`
+	CompletionTokens int    `json:",omitempty"`
+	TotalTokens      int    `json:",omitempty"`
+	CacheHitTokens   int    `json:",omitempty"`
+	CacheMissTokens  int    `json:",omitempty"`
+	ReasoningTokens  int    `json:",omitempty"`
+	IsFallback       bool   `json:",omitempty"`
+	FallbackAttempt  int    `json:",omitempty"`
+	FallbackReason   string `json:",omitempty"`
+	// ResponseContent holds the full response text when tracing.CaptureResponseContent enabled.
+	ResponseContent  string `json:",omitempty"`
 }
 
 // LLMDeltaPayload describes a streamed LLM delta.
