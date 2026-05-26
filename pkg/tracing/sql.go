@@ -208,10 +208,10 @@ WHERE session_key = ?
 `
 
 // Pruning DELETE statements
-const sqlPruneEvents = `DELETE FROM events WHERE created_at < datetime('now', ?||' days')`
-const sqlPruneLLMCalls = `DELETE FROM llm_calls WHERE created_at < datetime('now', ?||' days')`
-const sqlPruneContextSnapshots = `DELETE FROM context_snapshots WHERE created_at < datetime('now', ?||' days')`
-const sqlPruneSessions = `DELETE FROM sessions WHERE created_at < datetime('now', ?||' days')`
+const sqlPruneEvents = `DELETE FROM events WHERE created_at < datetime('now', '-' || ? || ' days')`
+const sqlPruneLLMCalls = `DELETE FROM llm_calls WHERE created_at < datetime('now', '-' || ? || ' days')`
+const sqlPruneContextSnapshots = `DELETE FROM context_snapshots WHERE created_at < datetime('now', '-' || ? || ' days')`
+const sqlPruneSessions = `DELETE FROM sessions WHERE created_at < datetime('now', '-' || ? || ' days')`
 
 // Aggressive pruning: delete oldest records to shrink DB
 const sqlPruneOldestEvents = `DELETE FROM events WHERE rowid IN (SELECT rowid FROM events ORDER BY rowid ASC LIMIT ?)`
