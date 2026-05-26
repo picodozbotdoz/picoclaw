@@ -157,6 +157,10 @@ type turnExecution struct {
         // Verification retry counter: incremented each time verification fails
         // and the coordinator re-enters the loop for the LLM to fix errors.
         verificationRetries int
+
+        // Tracing fields for LLM call recording (imp/tracking_ctx_window)
+        llmTraceID   string    // UUID trace ID shared between llm_request and llm_response
+        llmStartTime time.Time // start time captured before the LLM call
 }
 
 // newTurnExecution creates a turnExecution initialized from turnState and options.

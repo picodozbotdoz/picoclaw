@@ -5,11 +5,12 @@ package agent
 import (
         "context"
         "encoding/json"
-
-	"github.com/google/uuid"        "errors"
+        "errors"
         "fmt"
         "strings"
         "time"
+
+        "github.com/google/uuid"
 
         "github.com/sipeed/picoclaw/pkg/constants"
         "github.com/sipeed/picoclaw/pkg/logger"
@@ -193,6 +194,17 @@ func (p *Pipeline) CallLLM(
                 }
         }
 
+        // Setup tracing: generate trace ID, capture start time, and serialize messages.
+        exec.llmTraceID = uuid.New().String()
+        exec.llmStartTime = time.Now()
+        // Extract provider from model string (e.g., "deepseek/deepseek-v4-pro" → "deepseek")
+        providerName := "openai"
+        if idx := strings.Index(exec.llmModel, "/"); idx >= 0 {
+                providerName = exec.llmModel[:idx]
+        }
+        useStreaming := shouldUseStreaming(ts.agent, exec.activeProvider)
+        messagesJSON, _ := json.Marshal(exec.callMessages)
+
         al.emitEvent(
                 EventKindLLMRequest,
                 ts.eventMeta("runTurn", "turn.llm.request"),
@@ -202,6 +214,11 @@ func (p *Pipeline) CallLLM(
                         ToolsCount:    len(exec.providerToolDefs),
                         MaxTokens:     ts.agent.MaxTokens,
                         Temperature:   ts.agent.Temperature,
+                        TraceID:       exec.llmTraceID,
+                        Provider:      providerName,
+                        ThinkingMode:  string(exec.dynamicThinkingLevel),
+                        IsStreaming:    useStreaming,
+                        MessagesJSON:  string(messagesJSON),
                 },
         )
 
@@ -500,14 +517,28 @@ func (p *Pipeline) CallLLM(
                         al.targetReasoningChannelID(ts.channel),
                 )
         }
+        latencyMs := time.Since(exec.llmStartTime).Milliseconds()
+        respPayload := LLMResponsePayload{
+                ContentLen:   len(exec.response.Content),
+                ToolCalls:    len(exec.response.ToolCalls),
+                HasReasoning: exec.response.Reasoning != "" || exec.response.ReasoningContent != "",
+                TraceID:      exec.llmTraceID,
+                LatencyMs:    latencyMs,
+                ResponseContent: exec.response.Content,
+        }
+        if exec.response.Usage != nil {
+                respPayload.PromptTokens = exec.response.Usage.PromptTokens
+                respPayload.CompletionTokens = exec.response.Usage.CompletionTokens
+                respPayload.TotalTokens = exec.response.Usage.TotalTokens
+                respPayload.CacheHitTokens = exec.response.Usage.PromptCacheHitTokens
+                if exec.response.Usage.CompletionTokensDetails != nil {
+                        respPayload.ReasoningTokens = exec.response.Usage.CompletionTokensDetails.ReasoningTokens
+                }
+        }
         al.emitEvent(
                 EventKindLLMResponse,
                 ts.eventMeta("runTurn", "turn.llm.response"),
-                LLMResponsePayload{
-                        ContentLen:   len(exec.response.Content),
-                        ToolCalls:    len(exec.response.ToolCalls),
-                        HasReasoning: exec.response.Reasoning != "" || exec.response.ReasoningContent != "",
-                },
+                respPayload,
         )
 
         llmResponseFields := map[string]any{

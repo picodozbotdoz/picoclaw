@@ -65,6 +65,51 @@ func (es *EventSubscriber) handleEvent(evt agent.Event) {
                 return
         }
 
+        // LLM call tracing: persist llm_calls rows when TraceID is present.
+        // This is separate from generic event persistence because LLM calls
+        // have their own lifecycle (start → end) with request/response pairs.
+        switch evt.Kind {
+        case agent.EventKindLLMRequest:
+                if req, ok := evt.Payload.(agent.LLMRequestPayload); ok && req.TraceID != "" {
+                        es.store.LLMCallStart(
+                                req.TraceID,
+                                evt.Meta.SessionKey,
+                                evt.Meta.AgentID,
+                                evt.Meta.TurnID,
+                                evt.Meta.Iteration,
+                                LLMCallRequest{
+                                        Provider:       req.Provider,
+                                        Model:          req.Model,
+                                        MessagesCount:  req.MessagesCount,
+                                        ToolsCount:     req.ToolsCount,
+                                        MaxTokens:      req.MaxTokens,
+                                        Temperature:    req.Temperature,
+                                        ThinkingMode:   req.ThinkingMode,
+                                        IsStreaming:     req.IsStreaming,
+                                        RequestSnippet: req.MessagesJSON,
+                                },
+                        )
+                }
+        case agent.EventKindLLMResponse:
+                if resp, ok := evt.Payload.(agent.LLMResponsePayload); ok && resp.TraceID != "" {
+                        es.store.LLMCallEnd(resp.TraceID, LLMCallResponse{
+                                LatencyMs:        resp.LatencyMs,
+                                ContentLen:       resp.ContentLen,
+                                ToolCallsCount:   resp.ToolCalls,
+                                HasReasoning:     resp.HasReasoning,
+                                ResponseSnippet:  resp.ResponseContent,
+                                PromptTokens:     resp.PromptTokens,
+                                CompletionTokens: resp.CompletionTokens,
+                                TotalTokens:      resp.TotalTokens,
+                                CacheHitTokens:   resp.CacheHitTokens,
+                                ReasoningTokens:  resp.ReasoningTokens,
+                                IsFallback:       resp.IsFallback,
+                                FallbackAttempt:  resp.FallbackAttempt,
+                                FallbackReason:   resp.FallbackReason,
+                        })
+                }
+        }
+
         payloadJSON, err := json.Marshal(evt.Payload)
         if err != nil {
                 logger.WarnCF("tracing", "Failed to marshal event payload", map[string]any{
