@@ -5,7 +5,8 @@ package agent
 import (
         "context"
         "encoding/json"
-        "errors"
+
+	"github.com/google/uuid"        "errors"
         "fmt"
         "strings"
         "time"
