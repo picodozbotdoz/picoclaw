@@ -931,6 +931,28 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
         return messages
 }
 
+// toolResultMaxHistoryChars caps the content of tool result messages
+// when they appear in conversation history (from previous turns). Tool results
+// from the current turn remain at full length. This keeps the context window
+// compact by truncating verbose tool outputs (e.g., SQL query results,
+// status tables) that are no longer directly relevant to the current turn.
+// Set to 0 to disable truncation (preserve original behavior).
+const toolResultMaxHistoryChars = 500
+
+// truncateToolResultContent truncates a tool result message's content if it
+// exceeds the configured limit, adding a truncation indicator with original
+// length. Only applied to tool messages from saved history — not the current
+// turn's in-flight tool results.
+func truncateToolResultContent(msg providers.Message) providers.Message {
+        if len(msg.Content) <= toolResultMaxHistoryChars {
+                return msg
+        }
+        truncated := msg
+        truncated.Content = fmt.Sprintf("%s\n\n[...truncated from %d chars in history; full output was available at execution time...]",
+                utils.Truncate(msg.Content, toolResultMaxHistoryChars), len(msg.Content))
+        return truncated
+}
+
 func sanitizeHistoryForProvider(history []providers.Message) []providers.Message {
         if len(history) == 0 {
                 return history
@@ -968,7 +990,9 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
                                 logger.DebugCF("agent", "Dropping orphaned tool message", map[string]any{})
                                 continue
                         }
-                        sanitized = append(sanitized, msg)
+                        // Truncate verbose tool outputs from history to keep the context
+                        // window lean (deepseek v4 cache optimization).
+                        sanitized = append(sanitized, truncateToolResultContent(msg))
 
                 case "assistant":
                         if len(msg.ToolCalls) > 0 {
