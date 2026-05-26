@@ -183,6 +183,21 @@ func builtinPromptSources() []PromptSourceDescriptor {
                         Allowed:         []PromptPlacement{{Layer: PromptLayerCapability, Slot: PromptSlotTooling}},
                         StableByDefault: true,
                 },
+
+		{
+			ID:              PromptSourceExecBatching,
+			Owner:           "tools",
+			Description:     "Exec batching rules — combine related shell commands",
+			Allowed:         []PromptPlacement{{Layer: PromptLayerCapability, Slot: PromptSlotTooling}},
+			StableByDefault: true,
+		},
+		{
+			ID:              PromptSourceExecErrorDetection,
+			Owner:           "tools",
+			Description:     "Exec error detection rules — read errors, avoid retry loops",
+			Allowed:         []PromptPlacement{{Layer: PromptLayerCapability, Slot: PromptSlotTooling}},
+			StableByDefault: true,
+		},
                 {
                         ID:              PromptSourceToolRegistry,
                         Owner:           "tools",

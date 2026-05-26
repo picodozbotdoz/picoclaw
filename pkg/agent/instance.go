@@ -168,6 +168,8 @@ func NewAgentInstance(
                         mcpDiscoveryActive && cfg.Tools.MCP.Discovery.UseRegex,
                 ).
                 WithSafeEditWorkflow().
+
+		WithExecEfficiency().
                 WithSplitOnMarker(cfg.Agents.Defaults.SplitOnMarker)
         contextBuilder.InjectedContext = injectedContextStore
 

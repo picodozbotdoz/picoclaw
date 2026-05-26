@@ -90,6 +90,24 @@ func (cb *ContextBuilder) WithSafeEditWorkflow() *ContextBuilder {
         return cb
 }
 
+// WithExecEfficiency registers prompt contributors that encourage the LLM to
+// batch shell commands and handle exec failures intelligently. This reduces
+// the number of tool-call roundtrips and prevents retry-without-change loops
+// that waste LLM iterations and latency.
+func (cb *ContextBuilder) WithExecEfficiency() *ContextBuilder {
+        if err := cb.RegisterPromptContributor(execBatchingContributor{}); err != nil {
+                logger.WarnCF("agent", "Failed to register exec batching prompt contributor", map[string]any{
+                        "error": err.Error(),
+                })
+        }
+        if err := cb.RegisterPromptContributor(execErrorDetectionContributor{}); err != nil {
+                logger.WarnCF("agent", "Failed to register exec error detection prompt contributor", map[string]any{
+                        "error": err.Error(),
+                })
+        }
+        return cb
+}
+
 func (cb *ContextBuilder) WithSplitOnMarker(enabled bool) *ContextBuilder {
         cb.splitOnMarker = enabled
         return cb
