@@ -971,6 +971,43 @@ func truncateToolResultContent(msg providers.Message) providers.Message {
         return truncated
 }
 
+// toolOutputDedupThreshold is the minimum content length for a tool output
+// to be tracked for deduplication. Shorter outputs aren't worth deduping.
+const toolOutputDedupThreshold = 200
+
+// dedupToolResults replaces duplicate tool outputs (same content hash) with
+// compact references. This prevents re-read files and repeated exec outputs
+// from bloating the context window across iterations.
+func dedupToolResults(messages []providers.Message) []providers.Message {
+	seen := make(map[uint64]string)
+	out := make([]providers.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Role != "tool" || len(msg.Content) <= toolOutputDedupThreshold {
+			out = append(out, msg)
+			continue
+		}
+		h := fnvHash(msg.Content)
+		if first, ok := seen[h]; ok {
+			deduped := msg
+			deduped.Content = fmt.Sprintf(
+				"[Duplicate output — same as earlier tool result at %s. Content: %d chars, hash: %016x]",
+				first, len(msg.Content), h)
+			out = append(out, deduped)
+			continue
+		}
+		seen[h] = fmt.Sprintf("hash %016x", h)
+		out = append(out, msg)
+	}
+	return out
+}
+
+// fnvHash returns a 64-bit FNV-1a hash of a string.
+func fnvHash(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
+}
+
 func sanitizeHistoryForProvider(history []providers.Message) []providers.Message {
         if len(history) == 0 {
                 return history
@@ -1129,6 +1166,10 @@ func sanitizeHistoryForProvider(history []providers.Message) []providers.Message
 
                 final = append(final, msg)
         }
+
+        // Apply tool output deduplication: replace duplicate content (re-read
+        // files, repeated exec outputs) with compact hash references.
+        final = dedupToolResults(final)
 
         return final
 }

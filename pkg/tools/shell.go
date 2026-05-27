@@ -449,6 +449,22 @@ func (t *ExecTool) runSync(ctx context.Context, command, cwd string) *ToolResult
 	}
 
 	if err != nil {
+		// Heredoc truncation detection: if the command contains a heredoc pattern
+		// (e.g., python3 << 'PYEOF') and the output shows a syntax error or
+		// unexpected EOF, the heredoc body was likely truncated at the tool
+		// argument size limit. Suggest the write_file + exec pattern instead.
+		heredocPatterns := []string{"<< '", "<< \"", "<<EOF", "<<'EOF'", "<<PYEOF", "<<'PYEOF'", "<<SQL", "<<'SQL'"}
+		for _, hp := range heredocPatterns {
+			if strings.Contains(command, hp) && (strings.Contains(output, "SyntaxError") ||
+				strings.Contains(output, "unexpected EOF") ||
+				strings.Contains(output, "unterminated") ||
+				strings.Contains(output, "was unexpected") ||
+				strings.Contains(strings.ToLower(output), "syntax error") ||
+				strings.Contains(output, "IncompleteInput")) {
+				output += fmt.Sprintf("\n\n[HINT: Heredoc in command may have been truncated. Use write_file() to save the script, then exec(\"python3 script.py\") or exec(\"bash script.sh\") instead of inline heredoc.]")
+				break
+			}
+		}
 		return &ToolResult{
 			ForLLM:  output,
 			ForUser: output,
