@@ -588,6 +588,26 @@ func maybeParseDSMLResponse(response *LLMResponse) *LLMResponse {
                 }
         }
 
+
+        // Pico tool_use format: [tool_use: NAME, args: {...}]
+        // DeepSeek V4 sometimes outputs tool calls as inline [tool_use:] text
+        // instead of using the structured tool_calls API field.
+        // Parse and convert to structured tool calls.
+        if HasPicoToolCalls(response.Content) {
+        	toolCalls, remaining, err := ParsePicoToolCalls(response.Content)
+        	if err != nil {
+        		logger.WarnCF("provider", "Pico tool_use parse err", map[string]any{"error": err.Error()})
+        	}
+        	if len(toolCalls) > 0 {
+        		response.ToolCalls = toolCalls
+        		response.Content = remaining
+        		if response.FinishReason == "stop" {
+        			response.FinishReason = "tool_calls"
+        		}
+        		logger.InfoCF("provider", "Parsed tool calls from [tool_use:] format", map[string]any{"count": len(toolCalls)})
+        		return response
+        	}
+        }
         return response
 }
 
