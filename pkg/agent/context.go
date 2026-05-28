@@ -862,6 +862,12 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
                 PrefixHash:         prefixHash,
         })
 
+
+        history := sanitizeHistoryForProvider(req.History)
+
+        // Add conversation history
+        messages = append(messages, history...)
+
         // --- Build volatile system message (messages[1]) ---
         // Contains: InjectedContext + active skills + runtime context.
         // This changes per request but is small, so recomputation is cheap.
@@ -934,10 +940,6 @@ func (cb *ContextBuilder) BuildMessagesFromPrompt(req PromptBuildRequest) []prov
                         "preview": preview,
                 })
 
-        history := sanitizeHistoryForProvider(req.History)
-
-        // Add conversation history
-        messages = append(messages, history...)
 
         // Add current user message. Media-only turns must still be preserved so
         // multimodal providers receive the uploaded image even when the user sends
