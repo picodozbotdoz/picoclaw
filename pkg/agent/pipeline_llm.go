@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/constants"
+	runtimeevents "github.com/sipeed/picoclaw/pkg/events"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/providers"
 )
@@ -36,9 +37,10 @@ func (p *Pipeline) CallLLM(
 	// PreLLM: graceful terminal handling
 	exec.gracefulTerminal, _ = ts.gracefulInterruptRequested()
 	exec.providerToolDefs = ts.agent.Tools.ToProviderDefs()
+	exec.providerToolDefs = filterToolsByTurnProfile(exec.providerToolDefs, ts.profile)
 
 	// Native web search support
-	webSearchEnabled := al.cfg.Tools.IsToolEnabled("web")
+	webSearchEnabled := al.cfg.Tools.IsToolEnabled("web") && turnProfileToolAllowed(ts.profile, "web_search")
 	exec.useNativeSearch = webSearchEnabled && al.cfg.Tools.Web.PreferNative &&
 		func() bool {
 			if ns, ok := ts.agent.Provider.(providers.NativeSearchCapable); ok {
@@ -46,7 +48,6 @@ func (p *Pipeline) CallLLM(
 			}
 			return false
 		}()
-
 	if exec.useNativeSearch {
 		filtered := make([]providers.ToolDefinition, 0, len(exec.providerToolDefs))
 		for _, td := range exec.providerToolDefs {
@@ -72,14 +73,7 @@ func (p *Pipeline) CallLLM(
 	if exec.useNativeSearch {
 		exec.llmOpts["native_search"] = true
 	}
-	if ts.agent.ThinkingLevel != ThinkingOff {
-		if tc, ok := ts.agent.Provider.(providers.ThinkingCapable); ok && tc.SupportsThinking() {
-			exec.llmOpts["thinking_level"] = string(ts.agent.ThinkingLevel)
-		} else {
-			logger.WarnCF("agent", "thinking_level is set but current provider does not support it, ignoring",
-				map[string]any{"agent_id": ts.agent.ID, "thinking_level": string(ts.agent.ThinkingLevel)})
-		}
-	}
+	applyTurnThinkingOptions(exec, ts.agent, exec.activeProvider, true)
 
 	exec.llmModel = exec.activeModel
 
@@ -97,15 +91,27 @@ func (p *Pipeline) CallLLM(
 		switch decision.normalizedAction() {
 		case HookActionContinue, HookActionModify:
 			if llmReq != nil {
+				prevModel := exec.llmModel
 				exec.llmModel = llmReq.Model
 				exec.callMessages = llmReq.Messages
-				exec.providerToolDefs = llmReq.Tools
+				exec.providerToolDefs = filterToolsByTurnProfile(llmReq.Tools, ts.profile)
 				exec.llmOpts = llmReq.Options
+				nativeSearchAllowed := exec.useNativeSearch &&
+					turnProfileToolAllowed(ts.profile, "web_search")
+				if !nativeSearchAllowed {
+					delete(exec.llmOpts, "native_search")
+				}
+				if strings.TrimSpace(exec.llmModel) != "" && exec.llmModel != prevModel {
+					p.applyBeforeLLMModelRewrite(ts, exec)
+					applyTurnThinkingOptions(exec, ts.agent, exec.activeProvider, true)
+				}
 			}
 		case HookActionAbortTurn:
+			cancelConfiguredStreamingLLM(turnCtx, exec)
 			exec.abortedByHook = true
 			return ControlBreak, nil
 		case HookActionHardAbort:
+			cancelConfiguredStreamingLLM(turnCtx, exec)
 			_ = ts.requestHardAbort()
 			exec.abortedByHardAbort = true
 			return ControlBreak, nil
@@ -113,7 +119,7 @@ func (p *Pipeline) CallLLM(
 	}
 
 	al.emitEvent(
-		EventKindLLMRequest,
+		runtimeevents.KindAgentLLMRequest,
 		ts.eventMeta("runTurn", "turn.llm.request"),
 		LLMRequestPayload{
 			Model:         exec.llmModel,
@@ -154,16 +160,44 @@ func (p *Pipeline) CallLLM(
 		al.activeRequests.Add(1)
 		defer al.activeRequests.Done()
 
+		if response, handled, streamErr := p.tryConfiguredStreamingLLM(
+			providerCtx,
+			ts,
+			exec,
+			messagesForCall,
+			toolDefsForCall,
+		); handled {
+			return response, streamErr
+		}
+
 		if len(exec.activeCandidates) > 1 && p.Fallback != nil {
-			fbResult, fbErr := p.Fallback.Execute(
+			fbResult, fbErr := p.Fallback.ExecuteCandidate(
 				providerCtx,
 				exec.activeCandidates,
-				func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-					candidateProvider := exec.activeProvider
-					if cp, ok := ts.agent.CandidateProviders[providers.ModelKey(provider, model)]; ok {
-						candidateProvider = cp
+				func(ctx context.Context, candidate providers.FallbackCandidate) (*providers.LLMResponse, error) {
+					candidateProvider, err := providerForFallbackCandidate(
+						ts.agent,
+						exec.activeProvider,
+						exec.activeCandidates,
+						candidate.Provider,
+						candidate.Model,
+					)
+					if err != nil {
+						return nil, err
 					}
-					return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, model, exec.llmOpts)
+					callOpts := shallowCloneLLMOptions(exec.llmOpts)
+					delete(callOpts, "thinking_level")
+					candidateCfg := resolveActiveModelConfig(
+						p.Cfg,
+						ts.agent.Workspace,
+						[]providers.FallbackCandidate{candidate},
+						candidate.Model,
+						p.Cfg.Agents.Defaults.Provider,
+					)
+					candidateThinking := thinkingSettingsFromModelConfig(candidateCfg)
+					applyThinkingOption(callOpts, candidateProvider, candidateThinking, true, ts.agent.ID)
+					exec.suppressReasoning = shouldSuppressReasoningFor(candidateThinking)
+					return candidateProvider.Chat(ctx, messagesForCall, toolDefsForCall, candidate.Model, callOpts)
 				},
 			)
 			if fbErr != nil {
@@ -177,6 +211,16 @@ func (p *Pipeline) CallLLM(
 					map[string]any{"agent_id": ts.agent.ID, "iteration": iteration},
 				)
 			}
+			for _, candidate := range exec.activeCandidates {
+				if candidate.StableKey() != fbResult.IdentityKey {
+					continue
+				}
+				exec.llmModelName = resolvedCandidateModelName(
+					[]providers.FallbackCandidate{candidate},
+					exec.llmModelName,
+				)
+				break
+			}
 			return fbResult.Response, nil
 		}
 		return exec.activeProvider.Chat(providerCtx, messagesForCall, toolDefsForCall, exec.llmModel, exec.llmOpts)
@@ -184,7 +228,14 @@ func (p *Pipeline) CallLLM(
 
 	// Retry loop
 	var err error
-	maxRetries := 2
+	maxRetries := p.Cfg.Agents.Defaults.MaxLLMRetries
+	if maxRetries <= 0 {
+		maxRetries = 2
+	}
+	backoffSecs := p.Cfg.Agents.Defaults.LLMRetryBackoffSecs
+	if backoffSecs <= 0 {
+		backoffSecs = 2
+	}
 	for retry := 0; retry <= maxRetries; retry++ {
 		exec.response, err = callLLM(exec.callMessages, exec.providerToolDefs)
 		if err == nil {
@@ -195,11 +246,14 @@ func (p *Pipeline) CallLLM(
 			exec.abortedByHardAbort = true
 			return ControlBreak, nil
 		}
+		if isConfiguredStreamingVisibleError(err) {
+			break
+		}
 
 		// Retry without media if vision is unsupported
 		if hasMediaRefs(exec.callMessages) && isVisionUnsupportedError(err) && retry < maxRetries {
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
@@ -226,13 +280,8 @@ func (p *Pipeline) CallLLM(
 		}
 
 		errMsg := strings.ToLower(err.Error())
-		isTimeoutError := errors.Is(err, context.DeadlineExceeded) ||
-			strings.Contains(errMsg, "deadline exceeded") ||
-			strings.Contains(errMsg, "client.timeout") ||
-			strings.Contains(errMsg, "timed out") ||
-			strings.Contains(errMsg, "timeout exceeded")
-
-		isContextError := !isTimeoutError && (strings.Contains(errMsg, "context_length_exceeded") ||
+		retryReason, isTransientError := transientLLMRetryReason(err)
+		isContextError := !isTransientError && (strings.Contains(errMsg, "context_length_exceeded") ||
 			strings.Contains(errMsg, "context window") ||
 			strings.Contains(errMsg, "context_window") ||
 			strings.Contains(errMsg, "maximum context length") ||
@@ -243,21 +292,22 @@ func (p *Pipeline) CallLLM(
 			strings.Contains(errMsg, "prompt is too long") ||
 			strings.Contains(errMsg, "request too large"))
 
-		if isTimeoutError && retry < maxRetries {
-			backoff := time.Duration(retry+1) * 5 * time.Second
+		if isTransientError && retry < maxRetries {
+			backoff := time.Duration(retry+1) * time.Duration(backoffSecs) * time.Second
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
 					MaxRetries: maxRetries,
-					Reason:     "timeout",
+					Reason:     retryReason,
 					Error:      err.Error(),
 					Backoff:    backoff,
 				},
 			)
-			logger.WarnCF("agent", "Timeout error, retrying after backoff", map[string]any{
+			logger.WarnCF("agent", "Transient LLM error, retrying after backoff", map[string]any{
 				"error":   err.Error(),
+				"reason":  retryReason,
 				"retry":   retry,
 				"backoff": backoff.String(),
 			})
@@ -274,7 +324,7 @@ func (p *Pipeline) CallLLM(
 
 		if isContextError && retry < maxRetries && !ts.opts.NoHistory {
 			al.emitEvent(
-				EventKindLLMRetry,
+				runtimeevents.KindAgentLLMRetry,
 				ts.eventMeta("runTurn", "turn.llm.retry"),
 				LLMRetryPayload{
 					Attempt:    retry + 1,
@@ -318,13 +368,69 @@ func (p *Pipeline) CallLLM(
 				exec.history = asmResp.History
 				exec.summary = asmResp.Summary
 			}
-			exec.messages = ts.agent.ContextBuilder.BuildMessagesFromPrompt(
-				promptBuildRequestForTurn(ts, exec.history, exec.summary, "", nil),
+			contextualSkills := ts.activeSkills
+			if ts.agent.ContextBuilder != nil {
+				contextualSkills = ts.agent.ContextBuilder.ResolveActiveSkillsForContext(ts.activeSkills)
+			}
+			ts.recordSkillContextSnapshot(skillContextTriggerContextRetryRebuild, contextualSkills)
+			stableHistory, protectedTurnTail := splitHistoryForActiveTurn(
+				exec.history,
+				ts.persistedMessagesSnapshot(),
 			)
-			exec.callMessages = exec.messages
+			buildMessages := func(trimmedHistory []providers.Message) []providers.Message {
+				fullHistory := append(append([]providers.Message(nil), trimmedHistory...), protectedTurnTail...)
+				rebuildPromptReq := promptBuildRequestForTurn(ts, fullHistory, exec.summary, "", nil, p.Cfg)
+				rebuildPromptReq.ActiveSkills = append([]string(nil), contextualSkills...)
+				return ts.agent.ContextBuilder.BuildMessagesFromPrompt(rebuildPromptReq)
+			}
+			originalHistoryCount := len(exec.history)
+			var fit bool
+			var trimmedStableHistory []providers.Message
+			trimmedStableHistory, exec.callMessages, fit = trimHistoryToFitContextWindow(
+				stableHistory,
+				func(trimmedHistory []providers.Message) []providers.Message {
+					rebuilt := buildMessages(trimmedHistory)
+					if exec.gracefulTerminal {
+						return append(append([]providers.Message(nil), rebuilt...), ts.interruptHintMessage())
+					}
+					return rebuilt
+				},
+				ts.agent.ContextWindow,
+				exec.providerToolDefs,
+				ts.agent.MaxTokens,
+			)
+			exec.history = append(trimmedStableHistory, protectedTurnTail...)
+			exec.messages = buildMessages(trimmedStableHistory)
 			if exec.gracefulTerminal {
 				msgs := append([]providers.Message(nil), exec.messages...)
 				exec.callMessages = append(msgs, ts.interruptHintMessage())
+			}
+			if dropped := originalHistoryCount - len(exec.history); dropped > 0 {
+				logger.WarnCF("agent", "Trimmed rebuilt history after context retry compaction", map[string]any{
+					"session_key":     ts.sessionKey,
+					"retry":           retry,
+					"dropped_msgs":    dropped,
+					"remaining_msgs":  len(exec.history),
+					"context_window":  ts.agent.ContextWindow,
+					"max_tokens":      ts.agent.MaxTokens,
+					"still_overlimit": !fit,
+				})
+			} else if !fit {
+				logger.WarnCF("agent", "Context still exceeds budget after retry compaction rebuild", map[string]any{
+					"session_key":         ts.sessionKey,
+					"retry":               retry,
+					"history_msgs":        len(exec.history),
+					"protected_turn_msgs": len(protectedTurnTail),
+					"context_window":      ts.agent.ContextWindow,
+					"max_tokens":          ts.agent.MaxTokens,
+				})
+			}
+			if !fit {
+				err = fmt.Errorf(
+					"context window still exceeded after retry compaction; refusing to drop active turn messages: %w",
+					err,
+				)
+				break
 			}
 			continue
 		}
@@ -333,7 +439,7 @@ func (p *Pipeline) CallLLM(
 
 	if err != nil {
 		al.emitEvent(
-			EventKindError,
+			runtimeevents.KindAgentError,
 			ts.eventMeta("runTurn", "turn.error"),
 			ErrorPayload{
 				Stage:   "llm",
@@ -364,9 +470,11 @@ func (p *Pipeline) CallLLM(
 				exec.response = llmResp.Response
 			}
 		case HookActionAbortTurn:
+			cancelConfiguredStreamingLLM(turnCtx, exec)
 			exec.abortedByHook = true
 			return ControlBreak, nil
 		case HookActionHardAbort:
+			cancelConfiguredStreamingLLM(turnCtx, exec)
 			_ = ts.requestHardAbort()
 			exec.abortedByHardAbort = true
 			return ControlBreak, nil
@@ -381,13 +489,31 @@ func (p *Pipeline) CallLLM(
 		}
 	}
 
+	if exec.suppressReasoning {
+		exec.response.Reasoning = ""
+		exec.response.ReasoningContent = ""
+		exec.response.ReasoningDetails = nil
+	}
 	reasoningContent := responseReasoningContent(exec.response)
 	shouldPublishPicoToolCallInterim := ts.channel == "pico" && len(exec.response.ToolCalls) > 0
 	if shouldPublishPicoToolCallInterim {
 		// Pico tool-call turns publish their reasoning/content/tool summary as a
 		// structured sequence after the tool-call payload is normalized below.
 	} else if ts.channel == "pico" {
-		go al.publishPicoReasoning(turnCtx, reasoningContent, ts.chatID)
+		if exec.streamingPublisher != nil && exec.streamingPublisher.ReasoningPublished() {
+			if err := exec.streamingPublisher.FinalizeReasoning(turnCtx, reasoningContent); err != nil {
+				logger.WarnCF("agent", "Failed to finalize streamed pico reasoning", map[string]any{
+					"channel": ts.channel,
+					"chat_id": ts.chatID,
+					"error":   err.Error(),
+				})
+			}
+		} else {
+			// Publish pico thoughts before the turn context is canceled at return time.
+			// The async variant can race with turn teardown and intermittently drop the
+			// thought message in CI even though the LLM produced reasoning content.
+			al.publishPicoReasoning(turnCtx, reasoningContent, ts.chatID, ts.sessionKey, exec.llmModelName)
+		}
 	} else {
 		go al.handleReasoning(
 			turnCtx,
@@ -397,7 +523,7 @@ func (p *Pipeline) CallLLM(
 		)
 	}
 	al.emitEvent(
-		EventKindLLMResponse,
+		runtimeevents.KindAgentLLMResponse,
 		ts.eventMeta("runTurn", "turn.llm.response"),
 		LLMResponsePayload{
 			ContentLen:   len(exec.response.Content),
@@ -429,6 +555,7 @@ func (p *Pipeline) CallLLM(
 			responseContent = exec.response.ReasoningContent
 		}
 		if steerMsgs := al.dequeueSteeringMessagesForScope(ts.sessionKey); len(steerMsgs) > 0 {
+			cancelConfiguredStreamingLLM(turnCtx, exec)
 			logger.InfoCF("agent", "Steering arrived after direct LLM response; continuing turn",
 				map[string]any{
 					"agent_id":       ts.agent.ID,
@@ -438,6 +565,7 @@ func (p *Pipeline) CallLLM(
 			exec.pendingMessages = append(exec.pendingMessages, steerMsgs...)
 			return ControlContinue, nil
 		}
+
 		exec.finalContent = responseContent
 		logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 			map[string]any{
@@ -447,6 +575,7 @@ func (p *Pipeline) CallLLM(
 			})
 		return ControlBreak, nil
 	}
+	cancelConfiguredStreamingLLM(turnCtx, exec)
 
 	// Tool-call path: normalize and prepare for tool execution
 	exec.normalizedToolCalls = make([]providers.ToolCall, 0, len(exec.response.ToolCalls))
@@ -470,6 +599,7 @@ func (p *Pipeline) CallLLM(
 	assistantMsg := providers.Message{
 		Role:             "assistant",
 		Content:          exec.response.Content,
+		ModelName:        exec.llmModelName,
 		ReasoningContent: reasoningContent,
 	}
 	for _, tc := range exec.normalizedToolCalls {
@@ -513,6 +643,7 @@ func (p *Pipeline) CallLLM(
 		al.publishPicoToolCallInterim(
 			turnCtx,
 			ts,
+			exec.llmModelName,
 			reasoningContent,
 			exec.response.Content,
 			assistantMsg.ToolCalls,
@@ -520,4 +651,87 @@ func (p *Pipeline) CallLLM(
 	}
 
 	return ControlToolLoop, nil
+}
+
+func (p *Pipeline) applyBeforeLLMModelRewrite(ts *turnState, exec *turnExecution) {
+	if p == nil || ts == nil || ts.agent == nil || exec == nil {
+		return
+	}
+	rawModel := strings.TrimSpace(exec.llmModel)
+	if rawModel == "" {
+		return
+	}
+
+	defaultProvider := "openai"
+	if p.Cfg != nil {
+		if provider := strings.TrimSpace(p.Cfg.Agents.Defaults.Provider); provider != "" {
+			defaultProvider = provider
+		}
+	}
+	defaultProvider = effectiveDefaultProvider(defaultProvider)
+	candidates := resolveModelCandidates(p.Cfg, defaultProvider, rawModel, nil)
+	exec.activeCandidates = candidates
+	exec.activeModel = resolvedCandidateModel(candidates, rawModel)
+	exec.llmModel = exec.activeModel
+	exec.activeModelConfig = resolveActiveModelConfig(p.Cfg, ts.agent.Workspace, candidates, rawModel, defaultProvider)
+}
+
+func providerForFallbackCandidate(
+	agent *AgentInstance,
+	activeProvider providers.LLMProvider,
+	activeCandidates []providers.FallbackCandidate,
+	provider string,
+	model string,
+) (providers.LLMProvider, error) {
+	if agent != nil {
+		if cp, ok := agent.CandidateProviders[providers.ModelKey(provider, model)]; ok && cp != nil {
+			return cp, nil
+		}
+	}
+	if activeProvider == nil {
+		return nil, fmt.Errorf("fallback model %q has no active provider", model)
+	}
+	return activeProvider, nil
+}
+
+func transientLLMRetryReason(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+
+	if failErr := providers.ClassifyError(err, "", ""); failErr != nil {
+		switch failErr.Reason {
+		case providers.FailoverTimeout:
+			if failErr.Status >= 500 {
+				return "server_error", true
+			}
+			return "timeout", true
+		case providers.FailoverNetwork:
+			return "network", true
+		case providers.FailoverRateLimit, providers.FailoverOverloaded:
+			return "rate_limit", true
+		}
+	}
+
+	errMsg := strings.ToLower(err.Error())
+	if errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(errMsg, "deadline exceeded") ||
+		strings.Contains(errMsg, "client.timeout") ||
+		strings.Contains(errMsg, "timed out") ||
+		strings.Contains(errMsg, "timeout exceeded") {
+		return "timeout", true
+	}
+
+	if strings.Contains(errMsg, "connection reset") ||
+		strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "no such host") ||
+		strings.Contains(errMsg, "network is unreachable") ||
+		strings.Contains(errMsg, "read tcp") ||
+		strings.Contains(errMsg, "write tcp") ||
+		strings.Contains(errMsg, "eof") {
+		return "network", true
+	}
+
+	return "", false
 }

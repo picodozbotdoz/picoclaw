@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall clean help test build-all lint-docs
+.PHONY: all build install uninstall clean help test integration-test build-all lint-docs
 
 # Build variables
 BINARY_NAME=picoclaw
@@ -27,7 +27,7 @@ endif
 VERSION?=$(if $(VERSION_RAW),$(VERSION_RAW),dev)
 GIT_COMMIT=$(if $(GIT_COMMIT_RAW),$(GIT_COMMIT_RAW),dev)
 BUILD_TIME=$(if $(BUILD_TIME_RAW),$(BUILD_TIME_RAW),dev)
-GO_VERSION=$(if $(GO_VERSION_RAW),$(GO_VERSION_RAW),unknown)
+GO_VERSION=$(if $(GO_VERSION_RAW),$(firstword $(GO_VERSION_RAW)),unknown)
 CONFIG_PKG=github.com/sipeed/picoclaw/pkg/config
 LDFLAGS=-X $(CONFIG_PKG).Version=$(VERSION) -X $(CONFIG_PKG).GitCommit=$(GIT_COMMIT) -X $(CONFIG_PKG).BuildTime=$(BUILD_TIME) -X $(CONFIG_PKG).GoVersion=$(GO_VERSION) -s -w
 
@@ -378,6 +378,10 @@ vet: generate
 test: generate
 	@$(GO) test $(GOFLAGS) $$($(GO) list $(GOFLAGS) ./... | grep -v github.com/sipeed/picoclaw/web/)
 	@cd web && make test
+
+## integration-test: Run Docker-backed integration test suites
+integration-test:
+	@bash ./scripts/run-integration-tests.sh
 
 ## fmt: Format Go code
 fmt:

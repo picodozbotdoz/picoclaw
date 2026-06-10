@@ -49,6 +49,7 @@ type webSearchProviderConfig struct {
 	BaseURL    string   `json:"base_url,omitempty"`
 	APIKey     string   `json:"api_key,omitempty"`
 	APIKeys    []string `json:"api_keys,omitempty"`
+	Model      string   `json:"model,omitempty"`
 	APIKeySet  bool     `json:"api_key_set,omitempty"`
 }
 
@@ -446,6 +447,14 @@ func (h *Handler) handleUpdateWebSearchConfig(w http.ResponseWriter, r *http.Req
 		cfg.Tools.Web.DuckDuckGo.Enabled = settings.Enabled
 		cfg.Tools.Web.DuckDuckGo.MaxResults = settings.MaxResults
 	}
+	if settings, ok := req.Settings["gemini"]; ok {
+		cfg.Tools.Web.Gemini.Enabled = settings.Enabled
+		cfg.Tools.Web.Gemini.MaxResults = settings.MaxResults
+		cfg.Tools.Web.Gemini.Model = strings.TrimSpace(settings.Model)
+		if key := strings.TrimSpace(settings.APIKey); key != "" {
+			cfg.Tools.Web.Gemini.APIKey = *config.NewSecureString(key)
+		}
+	}
 	if settings, ok := req.Settings["brave"]; ok {
 		cfg.Tools.Web.Brave.Enabled = settings.Enabled
 		cfg.Tools.Web.Brave.MaxResults = settings.MaxResults
@@ -459,6 +468,14 @@ func (h *Handler) handleUpdateWebSearchConfig(w http.ResponseWriter, r *http.Req
 		cfg.Tools.Web.Tavily.BaseURL = strings.TrimSpace(settings.BaseURL)
 		if keys, ok := normalizeWebSearchAPIKeys(settings.APIKeys, settings.APIKey); ok {
 			cfg.Tools.Web.Tavily.SetAPIKeys(keys)
+		}
+	}
+	if settings, ok := req.Settings["kagi"]; ok {
+		cfg.Tools.Web.Kagi.Enabled = settings.Enabled
+		cfg.Tools.Web.Kagi.MaxResults = settings.MaxResults
+		cfg.Tools.Web.Kagi.BaseURL = strings.TrimSpace(settings.BaseURL)
+		if keys, ok := normalizeWebSearchAPIKeys(settings.APIKeys, settings.APIKey); ok {
+			cfg.Tools.Web.Kagi.SetAPIKeys(keys)
 		}
 	}
 	if settings, ok := req.Settings["perplexity"]; ok {
@@ -505,7 +522,16 @@ func normalizeWebSearchProvider(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "", "auto":
 		return "auto"
-	case "sogou", "brave", "tavily", "duckduckgo", "perplexity", "searxng", "glm_search", "baidu_search":
+	case "sogou",
+		"brave",
+		"tavily",
+		"kagi",
+		"duckduckgo",
+		"gemini",
+		"perplexity",
+		"searxng",
+		"glm_search",
+		"baidu_search":
 		return strings.ToLower(strings.TrimSpace(provider))
 	default:
 		return ""
@@ -549,6 +575,12 @@ func buildWebSearchConfigResponse(cfg *config.Config) webSearchConfigResponse {
 			Enabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
 			MaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
 		},
+		"gemini": {
+			Enabled:    cfg.Tools.Web.Gemini.Enabled,
+			MaxResults: cfg.Tools.Web.Gemini.MaxResults,
+			Model:      cfg.Tools.Web.Gemini.Model,
+			APIKeySet:  cfg.Tools.Web.Gemini.APIKey.String() != "",
+		},
 		"brave": {
 			Enabled:    cfg.Tools.Web.Brave.Enabled,
 			MaxResults: cfg.Tools.Web.Brave.MaxResults,
@@ -559,6 +591,12 @@ func buildWebSearchConfigResponse(cfg *config.Config) webSearchConfigResponse {
 			MaxResults: cfg.Tools.Web.Tavily.MaxResults,
 			BaseURL:    cfg.Tools.Web.Tavily.BaseURL,
 			APIKeySet:  len(cfg.Tools.Web.Tavily.APIKeys.Values()) > 0,
+		},
+		"kagi": {
+			Enabled:    cfg.Tools.Web.Kagi.Enabled,
+			MaxResults: cfg.Tools.Web.Kagi.MaxResults,
+			BaseURL:    cfg.Tools.Web.Kagi.BaseURL,
+			APIKeySet:  len(cfg.Tools.Web.Kagi.APIKeys.Values()) > 0,
 		},
 		"perplexity": {
 			Enabled:    cfg.Tools.Web.Perplexity.Enabled,
@@ -605,6 +643,13 @@ func buildWebSearchConfigResponse(cfg *config.Config) webSearchConfigResponse {
 			Current:    current == "duckduckgo",
 		},
 		{
+			ID:           "gemini",
+			Label:        "Gemini (Google Search)",
+			Configured:   picotools.WebSearchProviderReady(opts, "gemini"),
+			Current:      current == "gemini",
+			RequiresAuth: true,
+		},
+		{
 			ID:           "brave",
 			Label:        "Brave Search",
 			Configured:   picotools.WebSearchProviderReady(opts, "brave"),
@@ -616,6 +661,13 @@ func buildWebSearchConfigResponse(cfg *config.Config) webSearchConfigResponse {
 			Label:        "Tavily",
 			Configured:   picotools.WebSearchProviderReady(opts, "tavily"),
 			Current:      current == "tavily",
+			RequiresAuth: true,
+		},
+		{
+			ID:           "kagi",
+			Label:        "Kagi Search",
+			Configured:   picotools.WebSearchProviderReady(opts, "kagi"),
+			Current:      current == "kagi",
 			RequiresAuth: true,
 		},
 		{

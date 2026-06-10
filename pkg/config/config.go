@@ -17,6 +17,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg"
 	"github.com/sipeed/picoclaw/pkg/fileutil"
 	"github.com/sipeed/picoclaw/pkg/logger"
+	providercommon "github.com/sipeed/picoclaw/pkg/providers/common"
 )
 
 // rrCounter is a global counter for round-robin load balancing across models.
@@ -36,9 +37,11 @@ type Config struct {
 	Isolation IsolationConfig `json:"isolation,omitempty" yaml:"-"`
 	Agents    AgentsConfig    `json:"agents"              yaml:"-"`
 	Session   SessionConfig   `json:"session,omitempty"   yaml:"-"`
+	Evolution EvolutionConfig `json:"evolution,omitempty" yaml:"-"`
 	Channels  ChannelsConfig  `json:"channel_list"        yaml:"channel_list"`
 	ModelList SecureModelList `json:"model_list"          yaml:"model_list"` // New model-centric provider configuration
 	Gateway   GatewayConfig   `json:"gateway"             yaml:"-"`
+	Events    EventsConfig    `json:"events,omitempty"    yaml:"-"`
 	Hooks     HooksConfig     `json:"hooks,omitempty"     yaml:"-"`
 	Tools     ToolsConfig     `json:"tools"               yaml:",inline"`
 	Heartbeat HeartbeatConfig `json:"heartbeat"           yaml:"-"`
@@ -49,6 +52,126 @@ type Config struct {
 
 	// cache for sensitive values and compiled regex (computed once)
 	sensitiveCache *SensitiveDataCache
+}
+
+type EvolutionConfig struct {
+	Enabled         bool     `json:"enabled,omitempty"`
+	Mode            string   `json:"mode,omitempty"`
+	StateDir        string   `json:"state_dir,omitempty"`
+	MinTaskCount    int      `json:"min_task_count,omitempty"`
+	MinSuccessRatio float64  `json:"min_success_ratio,omitempty"`
+	ColdPathTrigger string   `json:"cold_path_trigger,omitempty"`
+	ColdPathTimes   []string `json:"cold_path_times,omitempty"`
+	// Deprecated: use MinTaskCount.
+	MinCaseCount int `json:"min_case_count,omitempty"`
+	// Deprecated: use MinSuccessRatio.
+	MinSuccessRate float64 `json:"min_success_rate,omitempty"`
+}
+
+func (c EvolutionConfig) MarshalJSON() ([]byte, error) {
+	out := struct {
+		Enabled         bool     `json:"enabled,omitempty"`
+		Mode            string   `json:"mode,omitempty"`
+		StateDir        string   `json:"state_dir,omitempty"`
+		MinTaskCount    int      `json:"min_task_count,omitempty"`
+		MinSuccessRatio float64  `json:"min_success_ratio,omitempty"`
+		ColdPathTrigger string   `json:"cold_path_trigger,omitempty"`
+		ColdPathTimes   []string `json:"cold_path_times,omitempty"`
+	}{
+		Enabled:         c.Enabled,
+		Mode:            c.Mode,
+		StateDir:        c.StateDir,
+		MinTaskCount:    c.EffectiveMinTaskCount(),
+		MinSuccessRatio: c.EffectiveMinSuccessRatio(),
+		ColdPathTrigger: strings.TrimSpace(c.ColdPathTrigger),
+		ColdPathTimes:   c.EffectiveColdPathTimes(),
+	}
+	if !out.Enabled {
+		out.Mode = ""
+		out.ColdPathTrigger = ""
+		out.ColdPathTimes = nil
+	}
+	return json.Marshal(out)
+}
+
+func (c EvolutionConfig) EffectiveMode() string {
+	if !c.Enabled {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Mode)) {
+	case "draft":
+		return "draft"
+	case "apply":
+		return "apply"
+	case "", "observe":
+		return "observe"
+	default:
+		return "observe"
+	}
+}
+
+func (c EvolutionConfig) RunsColdPathAutomatically() bool {
+	return c.RunsColdPathAfterTurn() || c.RunsColdPathScheduled()
+}
+
+func (c EvolutionConfig) ColdPathTriggerMode() string {
+	if c.EffectiveMode() != "draft" && c.EffectiveMode() != "apply" {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(c.ColdPathTrigger)) {
+	case "", "after_turn":
+		return "after_turn"
+	case "scheduled":
+		return "scheduled"
+	case "manual", "none", "off":
+		return "manual"
+	default:
+		return "after_turn"
+	}
+}
+
+func (c EvolutionConfig) RunsColdPathAfterTurn() bool {
+	return c.ColdPathTriggerMode() == "after_turn"
+}
+
+func (c EvolutionConfig) RunsColdPathScheduled() bool {
+	return c.ColdPathTriggerMode() == "scheduled"
+}
+
+func (c EvolutionConfig) EffectiveMinTaskCount() int {
+	if c.MinTaskCount > 0 {
+		return c.MinTaskCount
+	}
+	if c.MinCaseCount > 0 {
+		return c.MinCaseCount
+	}
+	return 2
+}
+
+func (c EvolutionConfig) EffectiveMinSuccessRatio() float64 {
+	if c.MinSuccessRatio > 0 {
+		return c.MinSuccessRatio
+	}
+	if c.MinSuccessRate > 0 {
+		return c.MinSuccessRate
+	}
+	return 0.7
+}
+
+func (c EvolutionConfig) EffectiveColdPathTimes() []string {
+	out := make([]string, 0, len(c.ColdPathTimes))
+	for _, value := range c.ColdPathTimes {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func (c EvolutionConfig) AutoAppliesDrafts() bool {
+	return c.EffectiveMode() == "apply"
 }
 
 // IsolationConfig controls subprocess isolation for commands started by PicoClaw.
@@ -71,6 +194,9 @@ type ExposePath struct {
 // Uses strings.Replacer for O(n+m) performance (computed once per SecurityConfig).
 // Short content (below FilterMinLength) is returned unchanged for performance.
 func (c *Config) FilterSensitiveData(content string) string {
+	if c == nil {
+		return content
+	}
 	// Check if filtering is enabled (default: true)
 	if !c.Tools.IsFilterSensitiveDataEnabled() {
 		return content
@@ -276,6 +402,9 @@ type AgentDefaults struct {
 	SplitOnMarker             bool               `json:"split_on_marker"                  env:"PICOCLAW_AGENTS_DEFAULTS_SPLIT_ON_MARKER"` // split messages on <|[SPLIT]|> marker
 	ContextManager            string             `json:"context_manager,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER"`
 	ContextManagerConfig      json.RawMessage    `json:"context_manager_config,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_CONTEXT_MANAGER_CONFIG"`
+	TurnProfile               TurnProfileConfig  `json:"turn_profile,omitempty"`
+	MaxLLMRetries             int                `json:"max_llm_retries,omitempty"        env:"PICOCLAW_AGENTS_DEFAULTS_MAX_LLM_RETRIES"`
+	LLMRetryBackoffSecs       int                `json:"llm_retry_backoff_secs,omitempty" env:"PICOCLAW_AGENTS_DEFAULTS_LLM_RETRY_BACKOFF_SECS"`
 }
 
 const DefaultMaxMediaSize = 20 * 1024 * 1024 // 20 MB
@@ -343,9 +472,25 @@ func (p *PlaceholderConfig) GetRandomText() string {
 }
 
 type StreamingConfig struct {
-	Enabled         bool `json:"enabled,omitempty"          env:"PICOCLAW_CHANNELS_TELEGRAM_STREAMING_ENABLED"`
-	ThrottleSeconds int  `json:"throttle_seconds,omitempty" env:"PICOCLAW_CHANNELS_TELEGRAM_STREAMING_THROTTLE_SECONDS"`
-	MinGrowthChars  int  `json:"min_growth_chars,omitempty" env:"PICOCLAW_CHANNELS_TELEGRAM_STREAMING_MIN_GROWTH_CHARS"`
+	Enabled         bool `json:"enabled,omitempty"`
+	ThrottleSeconds int  `json:"throttle_seconds,omitempty"`
+	MinGrowthChars  int  `json:"min_growth_chars,omitempty"`
+}
+
+func (c StreamingConfig) IsZero() bool {
+	return !c.Enabled && c.ThrottleSeconds == 0 && c.MinGrowthChars == 0
+}
+
+func (c StreamingConfig) WithDefaults(throttleSeconds, minGrowthChars int) StreamingConfig {
+	if c.Enabled {
+		if c.ThrottleSeconds == 0 {
+			c.ThrottleSeconds = throttleSeconds
+		}
+		if c.MinGrowthChars == 0 {
+			c.MinGrowthChars = minGrowthChars
+		}
+	}
+	return c
 }
 
 type WhatsAppSettings struct {
@@ -355,11 +500,12 @@ type WhatsAppSettings struct {
 }
 
 type TelegramSettings struct {
-	Token         SecureString    `json:"token,omitzero"      yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_TELEGRAM_TOKEN"`
-	BaseURL       string          `json:"base_url"            yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_BASE_URL"`
-	Proxy         string          `json:"proxy"               yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_PROXY"`
-	Streaming     StreamingConfig `json:"streaming,omitempty" yaml:"-"`
-	UseMarkdownV2 bool            `json:"use_markdown_v2"     yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_USE_MARKDOWN_V2"`
+	Token             SecureString    `json:"token,omitzero"       yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_TELEGRAM_TOKEN"`
+	BaseURL           string          `json:"base_url"             yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_BASE_URL"`
+	Proxy             string          `json:"proxy"                yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_PROXY"`
+	Streaming         StreamingConfig `json:"streaming,omitzero"   yaml:"-"`
+	UseMarkdownV2     bool            `json:"use_markdown_v2"      yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_USE_MARKDOWN_V2"`
+	MediaGroupDelayMS int             `json:"media_group_delay_ms" yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_MEDIA_GROUP_DELAY_MS"`
 }
 
 type FeishuSettings struct {
@@ -431,10 +577,11 @@ type WeComGroupConfig struct {
 }
 
 type WeComSettings struct {
-	BotID               string       `json:"bot_id"                  yaml:"-"                env:"BOT_ID"`
-	Secret              SecureString `json:"secret,omitzero"         yaml:"secret,omitempty" env:"SECRET"`
-	WebSocketURL        string       `json:"websocket_url,omitempty" yaml:"-"                env:"WEBSOCKET_URL"`
-	SendThinkingMessage bool         `json:"send_thinking_message"   yaml:"-"                env:"SEND_THINKING_MESSAGE"`
+	BotID               string          `json:"bot_id"                  yaml:"-"                env:"BOT_ID"`
+	Secret              SecureString    `json:"secret,omitzero"         yaml:"secret,omitempty" env:"SECRET"`
+	WebSocketURL        string          `json:"websocket_url,omitempty" yaml:"-"                env:"WEBSOCKET_URL"`
+	SendThinkingMessage bool            `json:"send_thinking_message"   yaml:"-"                env:"SEND_THINKING_MESSAGE"`
+	Streaming           StreamingConfig `json:"streaming,omitzero"      yaml:"-"`
 }
 
 func (c *WeComSettings) SetSecret(secret string) {
@@ -455,13 +602,14 @@ func (c *WeixinSettings) SetToken(token string) {
 }
 
 type PicoSettings struct {
-	Token           SecureString `json:"token,omitzero"              yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_PICO_TOKEN"`
-	AllowTokenQuery bool         `json:"allow_token_query,omitempty" yaml:"-"`
-	AllowOrigins    []string     `json:"allow_origins,omitempty"     yaml:"-"`
-	PingInterval    int          `json:"ping_interval,omitempty"     yaml:"-"`
-	ReadTimeout     int          `json:"read_timeout,omitempty"      yaml:"-"`
-	WriteTimeout    int          `json:"write_timeout,omitempty"     yaml:"-"`
-	MaxConnections  int          `json:"max_connections,omitempty"   yaml:"-"`
+	Token           SecureString    `json:"token,omitzero"              yaml:"token,omitempty" env:"PICOCLAW_CHANNELS_PICO_TOKEN"`
+	AllowTokenQuery bool            `json:"allow_token_query,omitempty" yaml:"-"`
+	AllowOrigins    []string        `json:"allow_origins,omitempty"     yaml:"-"`
+	Streaming       StreamingConfig `json:"streaming,omitzero"          yaml:"-"`
+	PingInterval    int             `json:"ping_interval,omitempty"     yaml:"-"`
+	ReadTimeout     int             `json:"read_timeout,omitempty"      yaml:"-"`
+	WriteTimeout    int             `json:"write_timeout,omitempty"     yaml:"-"`
+	MaxConnections  int             `json:"max_connections,omitempty"   yaml:"-"`
 }
 
 // SetToken sets the Pico token and marks it as dirty for security saving
@@ -512,6 +660,29 @@ type TeamsWebhookTarget struct {
 	Title      string       `json:"title,omitempty"      yaml:"-"`
 }
 
+type MQTTSettings struct {
+	Broker      string       `json:"broker"                 yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_BROKER"`
+	AgentID     string       `json:"agent_id"               yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_AGENT_ID"`
+	TopicPrefix string       `json:"topic_prefix,omitempty" yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_TOPIC_PREFIX"`
+	Username    SecureString `json:"username,omitzero"      yaml:"username,omitempty" env:"PICOCLAW_CHANNELS_MQTT_USERNAME"`
+	Password    SecureString `json:"password,omitzero"      yaml:"password,omitempty" env:"PICOCLAW_CHANNELS_MQTT_PASSWORD"`
+	ClientID    string       `json:"client_id,omitempty"    yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_CLIENT_ID"`
+	KeepAlive   int          `json:"keep_alive,omitempty"   yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_KEEP_ALIVE"`
+	QoS         int          `json:"qos,omitempty"          yaml:"-"                  env:"PICOCLAW_CHANNELS_MQTT_QOS"`
+}
+
+// SlackWebhookSettings configures the output-only Slack webhook channel.
+type SlackWebhookSettings struct {
+	Webhooks map[string]SlackWebhookTarget `json:"webhooks" yaml:"webhooks,omitempty"`
+}
+
+// SlackWebhookTarget represents a single Slack Incoming Webhook destination.
+type SlackWebhookTarget struct {
+	WebhookURL SecureString `json:"webhook_url,omitzero" yaml:"webhook_url,omitempty"`
+	Username   string       `json:"username,omitempty"   yaml:"-"`
+	IconEmoji  string       `json:"icon_emoji,omitempty" yaml:"-"`
+}
+
 type HeartbeatConfig struct {
 	Enabled  bool `json:"enabled"  env:"PICOCLAW_HEARTBEAT_ENABLED"`
 	Interval int  `json:"interval" env:"PICOCLAW_HEARTBEAT_INTERVAL"` // minutes, min 5
@@ -527,6 +698,14 @@ type VoiceConfig struct {
 	TTSModelName      string `json:"tts_model_name,omitempty"     env:"PICOCLAW_VOICE_TTS_MODEL_NAME"`
 	EchoTranscription bool   `json:"echo_transcription"           env:"PICOCLAW_VOICE_ECHO_TRANSCRIPTION"`
 	ElevenLabsAPIKey  string `json:"elevenlabs_api_key,omitempty" env:"PICOCLAW_VOICE_ELEVENLABS_API_KEY"`
+}
+
+type ModelStreamingConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+func (c ModelStreamingConfig) IsZero() bool {
+	return !c.Enabled
 }
 
 // ModelConfig represents a model-centric provider configuration.
@@ -553,12 +732,14 @@ type ModelConfig struct {
 	Workspace   string `json:"workspace,omitempty"`    // Workspace path for CLI-based providers
 
 	// Optional optimizations
-	RPM            int               `json:"rpm,omitempty"`              // Requests per minute limit
-	MaxTokensField string            `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
-	RequestTimeout int               `json:"request_timeout,omitempty"`
-	ThinkingLevel  string            `json:"thinking_level,omitempty"` // Extended thinking: off|low|medium|high|xhigh|adaptive
-	ExtraBody      map[string]any    `json:"extra_body,omitempty"`     // Additional fields to inject into request body
-	CustomHeaders  map[string]string `json:"custom_headers,omitempty"` // Additional headers to inject into every HTTP request
+	RPM                 int                  `json:"rpm,omitempty"`              // Requests per minute limit
+	MaxTokensField      string               `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
+	RequestTimeout      int                  `json:"request_timeout,omitempty"`
+	ThinkingLevel       string               `json:"thinking_level,omitempty"`        // Extended thinking: off|low|medium|high|xhigh|adaptive
+	ToolSchemaTransform string               `json:"tool_schema_transform,omitempty"` // Optional tool schema compatibility transform (e.g. "simple")
+	Streaming           ModelStreamingConfig `json:"streaming,omitzero"`              // Opt-in for provider streaming on this model entry
+	ExtraBody           map[string]any       `json:"extra_body,omitempty"`            // Additional fields to inject into request body
+	CustomHeaders       map[string]string    `json:"custom_headers,omitempty"`        // Additional headers to inject into every HTTP request
 
 	APIKeys SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty"` // API authentication keys (multiple keys for failover)
 
@@ -595,6 +776,24 @@ func (c *ModelConfig) Validate() error {
 	if c.Model == "" {
 		return fmt.Errorf("model is required")
 	}
+	if _, err := providercommon.NormalizeToolSchemaTransform(c.ToolSchemaTransform); err != nil {
+		return err
+	}
+
+	// Reject whitespace in model identifier
+	if strings.ContainsAny(c.Model, " \t\n\r") {
+		return fmt.Errorf("model identifier contains whitespace")
+	}
+
+	// Reject leading slash
+	if strings.HasPrefix(c.Model, "/") {
+		return fmt.Errorf("model identifier must not start with /")
+	}
+
+	// Reject consecutive slashes
+	if strings.Contains(c.Model, "//") {
+		return fmt.Errorf("model identifier must not contain //")
+	}
 	return nil
 }
 
@@ -616,6 +815,12 @@ type ToolDiscoveryConfig struct {
 
 type ToolConfig struct {
 	Enabled bool `json:"enabled" yaml:"-" env:"ENABLED"`
+}
+
+type MessageToolsConfig struct {
+	ToolConfig `yaml:"-" envPrefix:"PICOCLAW_TOOLS_MESSAGE_"`
+
+	MediaEnabled bool `json:"media_enabled" yaml:"-" env:"PICOCLAW_TOOLS_MESSAGE_MEDIA_ENABLED"`
 }
 
 type BraveConfig struct {
@@ -669,6 +874,31 @@ func (c *TavilyConfig) SetAPIKeys(keys []string) {
 	}
 }
 
+type KagiConfig struct {
+	Enabled    bool          `json:"enabled"           yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_KAGI_ENABLED"`
+	APIKeys    SecureStrings `json:"api_keys,omitzero" yaml:"api_keys,omitempty" env:"PICOCLAW_TOOLS_WEB_KAGI_API_KEYS"`
+	BaseURL    string        `json:"base_url"          yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_KAGI_BASE_URL"`
+	MaxResults int           `json:"max_results"       yaml:"-"                  env:"PICOCLAW_TOOLS_WEB_KAGI_MAX_RESULTS"`
+}
+
+// APIKey returns the Kagi API key
+func (c *KagiConfig) APIKey() string {
+	if len(c.APIKeys) == 0 {
+		return ""
+	}
+	return c.APIKeys[0].String()
+}
+
+// SetAPIKey sets the Kagi API key
+func (c *KagiConfig) SetAPIKey(key string) {
+	c.APIKeys = SimpleSecureStrings(key)
+}
+
+// SetAPIKeys sets the Kagi API keys
+func (c *KagiConfig) SetAPIKeys(keys []string) {
+	c.APIKeys = SimpleSecureStrings(keys...)
+}
+
 type DuckDuckGoConfig struct {
 	Enabled    bool `json:"enabled"     env:"PICOCLAW_TOOLS_WEB_DUCKDUCKGO_ENABLED"`
 	MaxResults int  `json:"max_results" env:"PICOCLAW_TOOLS_WEB_DUCKDUCKGO_MAX_RESULTS"`
@@ -677,6 +907,13 @@ type DuckDuckGoConfig struct {
 type SogouConfig struct {
 	Enabled    bool `json:"enabled"     env:"PICOCLAW_TOOLS_WEB_SOGOU_ENABLED"`
 	MaxResults int  `json:"max_results" env:"PICOCLAW_TOOLS_WEB_SOGOU_MAX_RESULTS"`
+}
+
+type GeminiSearchConfig struct {
+	Enabled    bool         `json:"enabled"          yaml:"-"                 env:"PICOCLAW_TOOLS_WEB_GEMINI_ENABLED"`
+	APIKey     SecureString `json:"api_key,omitzero" yaml:"api_key,omitempty" env:"PICOCLAW_TOOLS_WEB_GEMINI_API_KEY"`
+	Model      string       `json:"model"            yaml:"-"                 env:"PICOCLAW_TOOLS_WEB_GEMINI_MODEL"`
+	MaxResults int          `json:"max_results"      yaml:"-"                 env:"PICOCLAW_TOOLS_WEB_GEMINI_MAX_RESULTS"`
 }
 
 type PerplexityConfig struct {
@@ -722,16 +959,18 @@ type BaiduSearchConfig struct {
 }
 
 type WebToolsConfig struct {
-	ToolConfig  `                  yaml:"-"                      envPrefix:"PICOCLAW_TOOLS_WEB_"`
-	Brave       BraveConfig       `yaml:"brave,omitempty"                                        json:"brave"`
-	Tavily      TavilyConfig      `yaml:"tavily,omitempty"                                       json:"tavily"`
-	Sogou       SogouConfig       `yaml:"-"                                                      json:"sogou"`
-	DuckDuckGo  DuckDuckGoConfig  `yaml:"-"                                                      json:"duckduckgo"`
-	Perplexity  PerplexityConfig  `yaml:"perplexity,omitempty"                                   json:"perplexity"`
-	SearXNG     SearXNGConfig     `yaml:"-"                                                      json:"searxng"`
-	GLMSearch   GLMSearchConfig   `yaml:"glm_search,omitempty"                                   json:"glm_search"`
-	BaiduSearch BaiduSearchConfig `yaml:"baidu_search,omitempty"                                 json:"baidu_search"`
-	Provider    string            `yaml:"-"                                                      json:"provider,omitempty" env:"PICOCLAW_TOOLS_WEB_PROVIDER"`
+	ToolConfig  `                   yaml:"-"                      envPrefix:"PICOCLAW_TOOLS_WEB_"`
+	Brave       BraveConfig        `yaml:"brave,omitempty"                                        json:"brave"`
+	Tavily      TavilyConfig       `yaml:"tavily,omitempty"                                       json:"tavily"`
+	Kagi        KagiConfig         `yaml:"kagi,omitempty"                                         json:"kagi"`
+	Sogou       SogouConfig        `yaml:"-"                                                      json:"sogou"`
+	DuckDuckGo  DuckDuckGoConfig   `yaml:"-"                                                      json:"duckduckgo"`
+	Gemini      GeminiSearchConfig `yaml:"gemini,omitempty"                                       json:"gemini"`
+	Perplexity  PerplexityConfig   `yaml:"perplexity,omitempty"                                   json:"perplexity"`
+	SearXNG     SearXNGConfig      `yaml:"-"                                                      json:"searxng"`
+	GLMSearch   GLMSearchConfig    `yaml:"glm_search,omitempty"                                   json:"glm_search"`
+	BaiduSearch BaiduSearchConfig  `yaml:"baidu_search,omitempty"                                 json:"baidu_search"`
+	Provider    string             `yaml:"-"                                                      json:"provider,omitempty" env:"PICOCLAW_TOOLS_WEB_PROVIDER"`
 	// PreferNative controls whether to use provider-native web search when
 	// the active LLM supports it (e.g. OpenAI web_search_preview). When true,
 	// the client-side web_search tool is hidden to avoid duplicate search surfaces,
@@ -821,7 +1060,8 @@ type ToolsConfig struct {
 	I2C             ToolConfig         `json:"i2c"               yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_I2C_"`
 	InstallSkill    ToolConfig         `json:"install_skill"     yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_INSTALL_SKILL_"`
 	ListDir         ToolConfig         `json:"list_dir"          yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_LIST_DIR_"`
-	Message         ToolConfig         `json:"message"           yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_MESSAGE_"`
+	LoadImage       ToolConfig         `json:"load_image"        yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_LOAD_IMAGE_"`
+	Message         MessageToolsConfig `json:"message"           yaml:"-"`
 	ReadFile        ReadFileToolConfig `json:"read_file"         yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_READ_FILE_"`
 	Serial          ToolConfig         `json:"serial"            yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SERIAL_"`
 	SendFile        ToolConfig         `json:"send_file"         yaml:"-"                                                       envPrefix:"PICOCLAW_TOOLS_SEND_FILE_"`
@@ -950,7 +1190,11 @@ type MCPServerConfig struct {
 	Env map[string]string `json:"env,omitempty"`
 	// EnvFile is the path to a file containing environment variables (stdio only)
 	EnvFile string `json:"env_file,omitempty"`
-	// Type is "stdio", "sse", or "http" (default: stdio if command is set, sse if url is set)
+	// Type is "stdio", "sse", "http", or "streamable-http".
+	// "http" and "streamable-http" both select streamable HTTP request-response
+	// mode, while "sse" keeps the standalone SSE listener enabled for
+	// server-initiated notifications. Defaults: stdio if command is set, sse if
+	// url is set.
 	Type string `json:"type,omitempty"`
 	// URL is used for SSE/HTTP transport
 	URL string `json:"url,omitempty"`
@@ -1058,7 +1302,7 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 
-		err = makeBackup(path)
+		err = MakeBackup(path)
 		if err != nil {
 			return nil, err
 		}
@@ -1112,7 +1356,7 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 
-		err = makeBackup(path)
+		err = MakeBackup(path)
 		if err != nil {
 			return nil, err
 		}
@@ -1164,7 +1408,7 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, err
 		}
 
-		err = makeBackup(path)
+		err = MakeBackup(path)
 		if err != nil {
 			return nil, err
 		}
@@ -1208,6 +1452,9 @@ func LoadConfig(path string) (*Config, error) {
 	applySkillsRegistryEnvCompat(cfg)
 
 	if err = InitChannelList(cfg.Channels); err != nil {
+		return nil, err
+	}
+	if err = cfg.ValidateTurnProfile(); err != nil {
 		return nil, err
 	}
 	cfg.Gateway.Host, err = resolveGatewayHostFromEnv(gatewayHostBeforeEnv)
@@ -1315,7 +1562,7 @@ func applySkillsRegistryEnvCompat(cfg *Config) {
 	cfg.Tools.Skills.Registries.Set("github", githubCfg)
 }
 
-func makeBackup(path string) error {
+func MakeBackup(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
 	}
@@ -1443,6 +1690,19 @@ func (c *Config) SecurityCopyFrom(path string) error {
 	return loadSecurityConfig(c, securityPath(path))
 }
 
+// ResetToDefaults backs up the current config, creates a default config,
+// preserves security credentials from the existing config, and saves it.
+func ResetToDefaults(configPath string) error {
+	if err := MakeBackup(configPath); err != nil {
+		return fmt.Errorf("backup before reset: %w", err)
+	}
+	cfg := DefaultConfig()
+	if err := cfg.SecurityCopyFrom(configPath); err != nil {
+		logger.WarnF("could not preserve security config", map[string]any{"error": err})
+	}
+	return SaveConfig(configPath, cfg)
+}
+
 func expandMultiKeyModels(models []*ModelConfig) []*ModelConfig {
 	var expanded []*ModelConfig
 
@@ -1466,23 +1726,25 @@ func expandMultiKeyModels(models []*ModelConfig) []*ModelConfig {
 
 			// Create a copy for the additional key
 			additionalEntry := &ModelConfig{
-				ModelName:      expandedName,
-				Provider:       m.Provider,
-				Model:          m.Model,
-				APIBase:        m.APIBase,
-				APIKeys:        SimpleSecureStrings(keys[i]),
-				Proxy:          m.Proxy,
-				AuthMethod:     m.AuthMethod,
-				ConnectMode:    m.ConnectMode,
-				Workspace:      m.Workspace,
-				RPM:            m.RPM,
-				MaxTokensField: m.MaxTokensField,
-				RequestTimeout: m.RequestTimeout,
-				ThinkingLevel:  m.ThinkingLevel,
-				ExtraBody:      m.ExtraBody,
-				CustomHeaders:  m.CustomHeaders,
-				UserAgent:      m.UserAgent,
-				isVirtual:      true,
+				ModelName:           expandedName,
+				Provider:            m.Provider,
+				Model:               m.Model,
+				APIBase:             m.APIBase,
+				APIKeys:             SimpleSecureStrings(keys[i]),
+				Proxy:               m.Proxy,
+				AuthMethod:          m.AuthMethod,
+				ConnectMode:         m.ConnectMode,
+				Workspace:           m.Workspace,
+				RPM:                 m.RPM,
+				MaxTokensField:      m.MaxTokensField,
+				RequestTimeout:      m.RequestTimeout,
+				ThinkingLevel:       m.ThinkingLevel,
+				ToolSchemaTransform: m.ToolSchemaTransform,
+				Streaming:           m.Streaming,
+				ExtraBody:           m.ExtraBody,
+				CustomHeaders:       m.CustomHeaders,
+				UserAgent:           m.UserAgent,
+				isVirtual:           true,
 			}
 			expanded = append(expanded, additionalEntry)
 			fallbackNames = append(fallbackNames, expandedName)
@@ -1490,22 +1752,24 @@ func expandMultiKeyModels(models []*ModelConfig) []*ModelConfig {
 
 		// Create the primary entry with first key and fallbacks
 		primaryEntry := &ModelConfig{
-			ModelName:      originalName,
-			Provider:       m.Provider,
-			Model:          m.Model,
-			APIBase:        m.APIBase,
-			Proxy:          m.Proxy,
-			AuthMethod:     m.AuthMethod,
-			ConnectMode:    m.ConnectMode,
-			Workspace:      m.Workspace,
-			RPM:            m.RPM,
-			MaxTokensField: m.MaxTokensField,
-			RequestTimeout: m.RequestTimeout,
-			ThinkingLevel:  m.ThinkingLevel,
-			ExtraBody:      m.ExtraBody,
-			CustomHeaders:  m.CustomHeaders,
-			UserAgent:      m.UserAgent,
-			APIKeys:        SimpleSecureStrings(keys[0]),
+			ModelName:           originalName,
+			Provider:            m.Provider,
+			Model:               m.Model,
+			APIBase:             m.APIBase,
+			Proxy:               m.Proxy,
+			AuthMethod:          m.AuthMethod,
+			ConnectMode:         m.ConnectMode,
+			Workspace:           m.Workspace,
+			RPM:                 m.RPM,
+			MaxTokensField:      m.MaxTokensField,
+			RequestTimeout:      m.RequestTimeout,
+			ThinkingLevel:       m.ThinkingLevel,
+			ToolSchemaTransform: m.ToolSchemaTransform,
+			Streaming:           m.Streaming,
+			ExtraBody:           m.ExtraBody,
+			CustomHeaders:       m.CustomHeaders,
+			UserAgent:           m.UserAgent,
+			APIKeys:             SimpleSecureStrings(keys[0]),
 		}
 
 		// Prepend new fallbacks to existing ones
@@ -1545,6 +1809,8 @@ func (t *ToolsConfig) IsToolEnabled(name string) bool {
 		return t.InstallSkill.Enabled
 	case "list_dir":
 		return t.ListDir.Enabled
+	case "load_image":
+		return t.LoadImage.Enabled
 	case "message":
 		return t.Message.Enabled
 	case "read_file":

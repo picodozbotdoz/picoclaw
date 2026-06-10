@@ -89,6 +89,13 @@ channels:
     nickserv_password: "your-irc-nickserv-password"
     sasl_password: "your-irc-sasl-password"
 
+# Channel Settings (nested format for channels that use settings block)
+channel_list:
+  mqtt:
+    settings:
+      username: "your-mqtt-username"
+      password: "your-mqtt-password"
+
 # Web Tool API Keys
 web:
   brave:
@@ -145,7 +152,7 @@ You can now remove sensitive fields from `config.json` since they're loaded from
       "model_name": "gpt-5.4",
       "model": "openai/gpt-5.4",
       "api_base": "https://api.openai.com/v1",
-      "api_key": "sk-your-actual-api-key-here"
+      "api_keys": ["sk-your-actual-api-key-here"]
     }
   ],
   "channel_list": {
@@ -226,15 +233,31 @@ channels:
 - `channels.feishu.app_secret` → `config.channels.feishu.app_secret`
 - etc.
 
+Channels that use a `settings` block (e.g. MQTT) use the `channel_list` key instead:
+
+```yaml
+channel_list:
+  mqtt:
+    settings:
+      username: "value"
+      password: "value"
+```
+
+- `channel_list.mqtt.settings.username` → `config.channel_list.mqtt.settings.username`
+- `channel_list.mqtt.settings.password` → `config.channel_list.mqtt.settings.password`
+
 ### Web Tools
 
-**Brave, Tavily, Perplexity:**
+**Brave, Tavily, Perplexity, Kagi:**
 ```yaml
 web:
   brave:
     api_keys:
       - "key-1"
       - "key-2"
+  kagi:
+    api_keys:
+      - "your-kagi-api-key"
 ```
 - Use `api_keys` (plural) array format
 
@@ -295,16 +318,19 @@ model_list:
 - **Rate limit management**: Distribute usage across multiple keys
 - **High availability**: Reduce downtime during API provider issues
 
-### Web Tools (Brave/Tavily/Perplexity) - Single key
+### Web Tools (Brave/Tavily/Perplexity/Kagi) - Single key
 
 ```yaml
 web:
   brave:
     api_keys:
       - "BSA-your-key"
+  kagi:
+    api_keys:
+      - "your-kagi-api-key"
 ```
 
-### Web Tools (Brave/Tavily/Perplexity) - Multiple keys
+### Web Tools (Brave/Tavily/Perplexity/Kagi) - Multiple keys
 
 ```yaml
 web:
@@ -312,6 +338,10 @@ web:
     api_keys:
       - "BSA-key-1"
       - "BSA-key-2"
+  kagi:
+    api_keys:
+      - "kagi-key-1"
+      - "kagi-key-2"
 ```
 
 ### Web Tool (GLMSearch/BaiduSearch) - Single key only
@@ -538,7 +568,7 @@ go test ./pkg/config -run TestSecurityConfig
 
 - Ensure you're using `api_keys` (plural) in `.security.yml` for models and web tools (except GLMSearch/BaiduSearch)
 - Check that the array format is correct in YAML (proper indentation with dashes)
-- Remember: Models, Brave, Tavily, Perplexity MUST use `api_keys` (array format)
+- Remember: Models, Brave, Tavily, Perplexity, Kagi MUST use `api_keys` (array format)
 - GLMSearch and BaiduSearch MUST use `api_key` (single string format)
 
 ### Load Balancing/Failover Issues

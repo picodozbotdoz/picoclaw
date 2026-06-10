@@ -17,7 +17,7 @@ func toChannelHashes(cfg *config.Config) map[string]string {
 	_ = json.Unmarshal(marshal, &channelConfig)
 
 	for key, value := range channelConfig {
-		if !value["enabled"].(bool) {
+		if enabled, ok := value["enabled"].(bool); !ok || !enabled {
 			continue
 		}
 		hiddenValues(key, value, ch.Get(key))
@@ -94,7 +94,15 @@ func hiddenValues(key string, value map[string]any, ch *config.Channel) {
 		vv := value["webhooks"]
 		webhooks := make(map[string]string)
 		if vv != nil {
-			webhooks = vv.(map[string]string)
+			if m, ok := vv.(map[string]string); ok {
+				webhooks = m
+			} else if m, ok := vv.(map[string]any); ok {
+				for k, w := range m {
+					if s, ok := w.(string); ok {
+						webhooks[k] = s
+					}
+				}
+			}
 		}
 		if settings, ok := v.(*config.TeamsWebhookSettings); ok {
 			for name, target := range settings.Webhooks {
@@ -102,6 +110,24 @@ func hiddenValues(key string, value map[string]any, ch *config.Channel) {
 			}
 		}
 		value["webhooks"] = webhooks
+	case "mqtt":
+		if settings, ok := v.(*config.MQTTSettings); ok {
+			value["username"] = settings.Username.String()
+			value["password"] = settings.Password.String()
+		}
+	case "slack_webhook":
+		// Expose webhook URLs for hash computation (they contain secrets)
+		if settings, ok := v.(*config.SlackWebhookSettings); ok {
+			webhooks := make(map[string]any)
+			for name, target := range settings.Webhooks {
+				webhooks[name] = map[string]any{
+					"webhook_url": target.WebhookURL.String(),
+					"username":    target.Username,
+					"icon_emoji":  target.IconEmoji,
+				}
+			}
+			value["webhooks"] = webhooks
+		}
 	}
 }
 

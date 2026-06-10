@@ -29,11 +29,19 @@ type MCPToolInfo struct {
 
 // ContextStats describes current session context window usage.
 type ContextStats struct {
-	UsedTokens       int
-	TotalTokens      int // model context window
-	CompressAtTokens int // compression threshold
-	UsedPercent      int // 0-100
-	MessageCount     int
+	UsedTokens        int
+	TotalTokens       int // model context window
+	HistoryTokens     int // history-only tokens (what maybeSummarize checks)
+	CompressAtTokens  int // hard budget compression threshold
+	SummarizeAtTokens int // soft summarization trigger
+	UsedPercent       int // 0-100
+	MessageCount      int
+}
+
+// StopResult describes the outcome of a stop request for the current session.
+type StopResult struct {
+	Stopped  bool
+	TaskName string
 }
 
 // Runtime provides runtime dependencies to command handlers. It is constructed
@@ -55,4 +63,5 @@ type Runtime struct {
 	SwitchChannel      func(value string) error
 	ClearHistory       func() error
 	ReloadConfig       func() error
+	StopActiveTurn     func() (StopResult, error)
 }

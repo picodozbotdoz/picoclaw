@@ -30,6 +30,7 @@ type SubTurnConfig struct {
 	ActualSystemPrompt string
 	InitialMessages    []providers.Message
 	InitialTokenBudget *atomic.Int64 // Shared token budget for team members; nil if no budget
+	TargetAgentID      string        // If set, run as this agent (its workspace, model, tools)
 }
 
 type SubagentTask struct {
@@ -390,7 +391,10 @@ func (t *SubagentTool) Execute(ctx context.Context, args map[string]any) *ToolRe
 		return ErrorResult("task is required").WithError(fmt.Errorf("task parameter is required"))
 	}
 
-	label, _ := args["label"].(string)
+	label, ok := args["label"].(string)
+	if !ok {
+		label = ""
+	}
 
 	// Build system prompt for subagent
 	systemPrompt := fmt.Sprintf(

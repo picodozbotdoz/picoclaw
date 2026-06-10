@@ -127,7 +127,7 @@ export function ContextUsageRing({
               : "pointer-events-none scale-95 opacity-0"
           }`}
         >
-          <div className="bg-popover absolute -bottom-1.5 right-3 h-3 w-3 rotate-45 border-r border-b" />
+          <div className="bg-popover absolute right-3 -bottom-1.5 h-3 w-3 rotate-45 border-r border-b" />
 
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground text-xs">
@@ -143,6 +143,31 @@ export function ContextUsageRing({
               className="h-full rounded-full bg-violet-500 transition-all"
               style={{ width: `${barPercent}%` }}
             />
+          </div>
+
+          <div className="mt-2 space-y-0.5">
+            {usage.history_tokens != null && usage.history_tokens > 0 && (
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-muted-foreground">History</span>
+                <span className="tabular-nums">
+                  {formatTokens(usage.history_tokens)}
+                </span>
+              </div>
+            )}
+            <div className="flex items-center justify-between text-[10px]">
+              <span className="text-muted-foreground">{t("chat.contextCompressAt")}</span>
+              <span className="tabular-nums">
+                {formatTokens(usage.compress_at_tokens)}
+              </span>
+            </div>
+            {usage.summarize_at_tokens != null && usage.summarize_at_tokens > 0 && (
+              <div className="flex items-center justify-between text-[10px]">
+                <span className="text-muted-foreground">{t("chat.contextSummarizeAt")}</span>
+                <span className="tabular-nums">
+                  {formatTokens(usage.summarize_at_tokens)}
+                </span>
+              </div>
+            )}
           </div>
 
           <button

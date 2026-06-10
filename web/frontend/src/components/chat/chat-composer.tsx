@@ -1,5 +1,10 @@
 import { IconArrowUp, IconPhotoPlus, IconX } from "@tabler/icons-react"
-import type { KeyboardEvent } from "react"
+import {
+  type ClipboardEvent as ReactClipboardEvent,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useRef,
+} from "react"
 import { useTranslation } from "react-i18next"
 import TextareaAutosize from "react-textarea-autosize"
 
@@ -30,11 +35,17 @@ interface ChatComposerProps {
   attachments: ChatAttachment[]
   onInputChange: (value: string) => void
   onAddImages: () => void
+  onPaste: (event: ReactClipboardEvent<HTMLTextAreaElement>) => void
+  onDragEnter: (event: ReactDragEvent<HTMLDivElement>) => void
+  onDragLeave: (event: ReactDragEvent<HTMLDivElement>) => void
+  onDragOver: (event: ReactDragEvent<HTMLDivElement>) => void
+  onDrop: (event: ReactDragEvent<HTMLDivElement>) => void
   onRemoveAttachment: (index: number) => void
   onSend: () => void
   onContextDetail?: () => void
   inputDisabledReason: ChatInputDisabledReason | null
   canSend: boolean
+  isDragActive: boolean
   contextUsage?: ContextUsage
 }
 
@@ -43,23 +54,40 @@ export function ChatComposer({
   attachments,
   onInputChange,
   onAddImages,
+  onPaste,
+  onDragEnter,
+  onDragLeave,
+  onDragOver,
+  onDrop,
   onRemoveAttachment,
   onSend,
   onContextDetail,
   inputDisabledReason,
   canSend,
+  isDragActive,
   contextUsage,
 }: ChatComposerProps) {
   const { t } = useTranslation()
   const canInput = inputDisabledReason === null
+  const composingRef = useRef(false)
   const disabledMessage =
     inputDisabledReason === null
       ? null
       : t(`chat.disabledPlaceholder.${inputDisabledReason}`)
   const placeholder = disabledMessage ?? t("chat.placeholder")
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return
+  const handleKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    const nativeEvent = e.nativeEvent as Event & {
+      isComposing?: boolean
+      keyCode?: number
+    }
+    if (
+      composingRef.current ||
+      nativeEvent.isComposing ||
+      nativeEvent.keyCode === 229
+    ) {
+      return
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
       onSend()
@@ -67,8 +95,25 @@ export function ChatComposer({
   }
 
   return (
-    <div className="before:bg-background pointer-events-none relative z-10 -mt-[24px] shrink-0 overflow-y-auto px-4 pb-[calc(1rem+env(safe-area-inset-bottom))] [scrollbar-gutter:stable] before:pointer-events-none before:absolute before:inset-x-0 before:top-[24px] before:bottom-0 before:content-[''] md:px-8 md:pb-8 lg:px-24 xl:px-48">
-      <div className="bg-card border-border/60 pointer-events-auto relative mx-auto flex max-w-[1000px] flex-col rounded-2xl border p-3 shadow-sm">
+    <div className="before:bg-background pointer-events-none relative z-10 -mt-[24px] shrink-0 [scrollbar-gutter:stable] overflow-y-auto px-4 pb-[calc(1rem+env(safe-area-inset-bottom))] before:pointer-events-none before:absolute before:inset-x-0 before:top-[24px] before:bottom-0 before:content-[''] md:px-8 md:pb-8 lg:px-24 xl:px-48">
+      <div
+        className={cn(
+          "bg-card border-border/60 pointer-events-auto relative mx-auto flex max-w-[1000px] flex-col rounded-2xl border p-3 shadow-sm transition-colors",
+          isDragActive && "border-violet-400/70 bg-violet-500/5",
+        )}
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+      >
+        {isDragActive && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-violet-400/70 bg-violet-500/10">
+            <div className="bg-background/95 text-foreground rounded-full px-4 py-2 text-sm font-medium shadow-sm">
+              {t("chat.dropImagesActive")}
+            </div>
+          </div>
+        )}
+
         {attachments.length > 0 && (
           <div className="mb-3 flex flex-wrap gap-2 px-2">
             {attachments.map((attachment, index) => (
@@ -98,6 +143,13 @@ export function ChatComposer({
         <TextareaAutosize
           value={input}
           onChange={(e) => onInputChange(e.target.value)}
+          onCompositionStart={() => {
+            composingRef.current = true
+          }}
+          onCompositionEnd={() => {
+            composingRef.current = false
+          }}
+          onPaste={onPaste}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
           disabled={!canInput}
@@ -128,7 +180,10 @@ export function ChatComposer({
 
           <div className="flex items-center gap-1.5">
             {contextUsage && (
-              <ContextUsageRing usage={contextUsage} onDetailClick={onContextDetail} />
+              <ContextUsageRing
+                usage={contextUsage}
+                onDetailClick={onContextDetail}
+              />
             )}
             {canInput ? (
               <Tooltip delayDuration={700}>
